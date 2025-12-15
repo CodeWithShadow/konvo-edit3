@@ -380,39 +380,110 @@ function hideBanCheckOverlay() {
   }
 }
 
+async function checkFullUnbanStatus() {
+  if (!state.db || !state.deviceInfo) return;
+  
+  try {
+    let stillBanned = false;
+    
+    // Check user ban
+    if (state.currentUserId) {
+      const userBanRef = doc(state.db, "banned_users", state.currentUserId);
+      const userBanSnap = await getDoc(userBanRef);
+      if (userBanSnap.exists()) stillBanned = true;
+    }
+    
+    // Check fingerprint ban
+    if (!stillBanned && state.deviceInfo.fingerprint) {
+      const fpBanRef = doc(state.db, "banned_devices", state.deviceInfo.fingerprint);
+      const fpBanSnap = await getDoc(fpBanRef);
+      if (fpBanSnap.exists()) stillBanned = true;
+    }
+    
+    // Check IP ban
+    if (!stillBanned && state.deviceInfo.ipHash) {
+      const ipBanRef = doc(state.db, "banned_ips", state.deviceInfo.ipHash);
+      const ipBanSnap = await getDoc(ipBanRef);
+      if (ipBanSnap.exists()) stillBanned = true;
+    }
+    
+    // Check raw IP ban
+    if (!stillBanned && state.deviceInfo.ipAddress) {
+      const rawIpKey = state.deviceInfo.ipAddress.replace(/\./g, '_');
+      const rawIpBanRef = doc(state.db, "banned_ips", rawIpKey);
+      const rawIpBanSnap = await getDoc(rawIpBanRef);
+      if (rawIpBanSnap.exists()) stillBanned = true;
+    }
+    
+    if (!stillBanned) {
+      // Fully unbanned!
+      state.isBanned = false;
+      state.isDeviceBanned = false;
+      showUnbannedScreen();
+    }
+    
+  } catch (error) {
+    console.error("Error checking unban status:", error);
+  }
+}
+
 /**
  * Show device banned screen
  * @param {string} reason - Ban reason
  */
 function showDeviceBannedScreen(reason = 'Device banned') {
-  const overlay = document.getElementById('banCheckOverlay');
-  if (overlay) {
-    // Clear existing content and add banned message
-    overlay.innerHTML = '';
-    overlay.className = 'ban-check-overlay';
-    
-    const contentDiv = document.createElement('div');
-    contentDiv.className = 'device-banned-content';
-    
-    const h1 = document.createElement('h1');
-    h1.textContent = '🚫 ACCESS DENIED';
-    
-    const p1 = document.createElement('p');
-    p1.textContent = 'This device has been banned from Konvo.';
-    
-    const p2 = document.createElement('p');
-    p2.className = 'reason';
-    p2.textContent = 'Reason: ' + sanitizeText(reason);
-    
-    contentDiv.appendChild(h1);
-    contentDiv.appendChild(p1);
-    contentDiv.appendChild(p2);
-    overlay.appendChild(contentDiv);
-    
-    overlay.style.display = 'flex';
-    overlay.classList.remove('hidden');
-  }
+  // Hide app content instead of destroying it
+  const appContainer = document.getElementById('app') || document.body;
+  Array.from(appContainer.children).forEach(child => {
+    if (child.id !== 'banOverlayScreen') {
+      child.style.display = 'none';
+    }
+  });
   
+  // Remove existing overlays
+  const existingOverlay = document.getElementById('banOverlayScreen');
+  if (existingOverlay) existingOverlay.remove();
+  const existingCheck = document.getElementById('banCheckOverlay');
+  if (existingCheck) existingCheck.style.display = 'none';
+  
+  // Create device ban overlay
+  const overlay = document.createElement('div');
+  overlay.id = 'banOverlayScreen';
+  overlay.style.cssText = `
+    position: fixed;
+    inset: 0;
+    background-color: #0a0a0a;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 99999;
+    gap: 0.5rem;
+    padding: 1rem;
+  `;
+  
+  const h1 = document.createElement('h1');
+  h1.style.cssText = 'font-size: 1.875rem; color: #ef4444; font-weight: bold;';
+  h1.textContent = '🚫 ACCESS DENIED';
+  
+  const p1 = document.createElement('p');
+  p1.style.cssText = 'color: #888; font-size: 0.875rem;';
+  p1.textContent = 'This device has been banned from Konvo.';
+  
+  const p2 = document.createElement('p');
+  p2.style.cssText = 'color: #666; font-size: 0.75rem;';
+  p2.textContent = 'Reason: ' + sanitizeText(reason);
+  
+  const p3 = document.createElement('p');
+  p3.style.cssText = 'color: #555; font-size: 0.75rem; margin-top: 1rem;';
+  p3.textContent = 'If you believe this is a mistake, please wait for admin review.';
+  
+  overlay.appendChild(h1);
+  overlay.appendChild(p1);
+  overlay.appendChild(p2);
+  overlay.appendChild(p3);
+  
+  document.body.appendChild(overlay);
   document.body.classList.add('device-banned');
 }
 
@@ -919,6 +990,25 @@ function cleanupAllListeners() {
   });
 }
 
+// ADD THIS NEW FUNCTION:
+function cleanupNonBanListeners() {
+  const banListenerKeys = ['banCheck', 'deviceBanCheck', 'ipBanCheck'];
+  
+  Object.entries(unsubscribers).forEach(([key, unsub]) => {
+    // Keep ban listeners active so we can detect unban
+    if (banListenerKeys.includes(key)) return;
+    
+    if (typeof unsub === 'function') {
+      try {
+        unsub();
+        unsubscribers[key] = () => {};
+      } catch (e) {
+        console.warn(`Failed to unsubscribe ${key}:`, e);
+      }
+    }
+  });
+}
+
 // ============================================================
 // ANTI-SPAM SYSTEM
 // ============================================================
@@ -978,7 +1068,7 @@ function checkSpamStatus() {
     const remaining = SPAM_CONFIG.MAX_MESSAGES - messageCount;
     return { 
       allowed: true, 
-      warning: `⚠️ Slow down! ${remaining} messages left before auto-ban.`
+      warning: ` Spamming = Getting Banned ⚠️.`
     };
   }
   
@@ -1081,43 +1171,61 @@ async function autoBanForSpam() {
 /**
  * Show banned screen specifically for spam
  */
+
 function showSpamBannedScreen() {
-  document.body.innerHTML = '';
-  document.body.className = 'banned-overlay';
-  document.body.style.background = '#0a0a0a';
+  // Hide app content
+  const appContainer = document.getElementById('app') || document.body;
+  Array.from(appContainer.children).forEach(child => {
+    if (child.id !== 'banOverlayScreen') {
+      child.style.display = 'none';
+    }
+  });
   
-  const container = document.createElement('div');
-  container.className = 'text-center p-6';
+  // Remove existing overlays
+  const existingOverlay = document.getElementById('banOverlayScreen');
+  if (existingOverlay) existingOverlay.remove();
+  
+  // Create spam ban overlay
+  const overlay = document.createElement('div');
+  overlay.id = 'banOverlayScreen';
+  overlay.style.cssText = `
+    position: fixed;
+    inset: 0;
+    background-color: #0a0a0a;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 99999;
+    gap: 0.5rem;
+    padding: 1rem;
+    text-align: center;
+  `;
   
   const h1 = document.createElement('h1');
-  h1.className = 'text-3xl mb-4';
-  h1.style.color = '#ef4444';
-  h1.textContent = '🚫 AUTO-BANNED FOR SPAM';
+  h1.style.cssText = 'font-size: 1.875rem; color: #ef4444; font-weight: bold;';
+  h1.textContent = '🚫 BANNED FOR SPAMMING';
   
   const p1 = document.createElement('p');
-  p1.style.color = '#888';
-  p1.className = 'mb-2';
-  p1.textContent = 'You have been automatically banned for spamming.';
+  p1.style.cssText = 'color: #888; font-size: 0.875rem;';
+  p1.textContent = 'You have been banned by ADMIN for SPAMMING.';
   
   const p2 = document.createElement('p');
-  p2.style.color = '#666';
-  p2.className = 'mb-4 text-sm';
-  p2.textContent = `Reason: Sent more than ${SPAM_CONFIG.MAX_MESSAGES} messages in ${SPAM_CONFIG.TIME_WINDOW / 1000} seconds.`;
+  p2.style.cssText = 'color: #666; font-size: 0.75rem;';
+  p2.textContent = `Reason: Mana kiya tha Maat kar  .`;
   
   const p3 = document.createElement('p');
-  p3.style.color = '#555';
-  p3.className = 'text-xs';
-  p3.textContent = 'Your device and IP have also been banned.';
+  p3.style.cssText = 'color: #555; font-size: 0.7rem; margin-top: 1rem;';
+  p3.textContent = 'Le Lauda ho gya BAN.';
   
-  container.appendChild(h1);
-  container.appendChild(p1);
-  container.appendChild(p2);
-  container.appendChild(p3);
-  document.body.appendChild(container);
+  overlay.appendChild(h1);
+  overlay.appendChild(p1);
+  overlay.appendChild(p2);
+  overlay.appendChild(p3);
   
-  // Cleanup listeners
-  cleanupAllListeners();
+  document.body.appendChild(overlay);
 }
+
 
 /**
  * Show spam warning toast
@@ -1745,15 +1853,14 @@ function listenForBanStatus() {
         if (!state.isBanned) {
           state.isBanned = true;
           state.userProfiles = {};
-          cleanupAllListeners();
+          cleanupNonBanListeners(); // ✅ Keep ban listeners active!
           showBannedScreen();
         }
       } else {
         // User is NOT banned (unbanned or never banned)
         if (state.isBanned) {
           state.isBanned = false;
-          // Show recovery message - user needs to refresh
-          showUnbannedRecoveryScreen();
+          showUnbannedScreen(); // ✅ Show recovery option
         }
       }
     },
@@ -1767,7 +1874,6 @@ function listenForBanStatus() {
  * Listen for device-level bans (fingerprint & IP) - FIXED
  */
 function listenForDeviceBans() {
-  // Cleanup existing listeners
   if (typeof unsubscribers.deviceBanCheck === 'function') {
     unsubscribers.deviceBanCheck();
     unsubscribers.deviceBanCheck = () => {};
@@ -1786,14 +1892,13 @@ function listenForDeviceBans() {
       if (docSnap.exists()) {
         if (!state.isDeviceBanned) {
           state.isDeviceBanned = true;
-          cleanupAllListeners();
+          cleanupNonBanListeners(); // ✅ Keep ban listeners active!
           showDeviceBannedScreen('Device fingerprint banned');
         }
       } else {
-        // Device is unbanned
+        // Device ban removed - check if fully unbanned
         if (state.isDeviceBanned) {
-          // Check if IP is also unbanned before recovering
-          checkAndRecoverFromBan();
+          checkFullUnbanStatus();
         }
       }
     },
@@ -1802,7 +1907,7 @@ function listenForDeviceBans() {
     }
   );
   
-  // Listen for IP ban - NOW STORED PROPERLY
+  // Listen for IP ban
   if (state.deviceInfo.ipHash) {
     unsubscribers.ipBanCheck = onSnapshot(
       doc(state.db, "banned_ips", state.deviceInfo.ipHash), 
@@ -1810,13 +1915,13 @@ function listenForDeviceBans() {
         if (docSnap.exists()) {
           if (!state.isDeviceBanned) {
             state.isDeviceBanned = true;
-            cleanupAllListeners();
+            cleanupNonBanListeners(); // ✅ Keep ban listeners active!
             showDeviceBannedScreen('IP address banned');
           }
         } else {
-          // IP is unbanned - check if fingerprint is also unbanned
+          // IP ban removed - check if fully unbanned
           if (state.isDeviceBanned) {
-            checkAndRecoverFromBan();
+            checkFullUnbanStatus();
           }
         }
       },
@@ -1831,106 +1936,109 @@ function listenForDeviceBans() {
  * Show recovery screen when user is unbanned
  * User needs to refresh to continue using the app
  */
-function showUnbannedRecoveryScreen() {
-  // If body was replaced with banned screen, show recovery
-  const existingContent = document.getElementById('feedContainer');
+function showUnbannedScreen() {
+  // Remove ban overlay
+  const banOverlay = document.getElementById('banOverlayScreen');
+  if (banOverlay) banOverlay.remove();
   
-  if (!existingContent) {
-    // Body was replaced, show recovery screen
-    document.body.innerHTML = '';
-    document.body.className = 'banned-overlay';
-    document.body.style.background = '#0a0a0a';
-    
-    const container = document.createElement('div');
-    container.className = 'text-center p-6';
-    
-    const h1 = document.createElement('h1');
-    h1.className = 'text-3xl mb-4';
-    h1.style.color = '#22c55e';
-    h1.textContent = '✅ ACCESS RESTORED';
-    
-    const p = document.createElement('p');
-    p.style.color = '#888';
-    p.className = 'mb-6';
-    p.textContent = 'Your ban has been lifted. Please refresh to continue.';
-    
-    const btn = document.createElement('button');
-    btn.className = 'px-6 py-3 bg-white text-black rounded-lg font-bold';
-    btn.style.cursor = 'pointer';
-    btn.textContent = 'REFRESH PAGE';
-    btn.onclick = () => window.location.reload();
-    
-    container.appendChild(h1);
-    container.appendChild(p);
-    container.appendChild(btn);
-    document.body.appendChild(container);
-  } else {
-    // App is still intact, just reset state
-    state.isBanned = false;
-    state.isDeviceBanned = false;
-  }
-}
-
-/**
- * Check if device is fully unbanned and recover
- */
-async function checkAndRecoverFromBan() {
-  if (!state.db || !state.deviceInfo) return;
-  
-  try {
-    // Check fingerprint ban
-    if (state.deviceInfo.fingerprint) {
-      const fingerprintBanRef = doc(state.db, "banned_devices", state.deviceInfo.fingerprint);
-      const fingerprintSnap = await getDoc(fingerprintBanRef);
-      
-      if (fingerprintSnap.exists()) {
-        return; // Still banned by fingerprint
-      }
-    }
-    
-    // Check IP ban
-    if (state.deviceInfo.ipHash) {
-      const ipBanRef = doc(state.db, "banned_ips", state.deviceInfo.ipHash);
-      const ipSnap = await getDoc(ipBanRef);
-      
-      if (ipSnap.exists()) {
-        return; // Still banned by IP
-      }
-    }
-    
-    // Check raw IP ban
-    if (state.deviceInfo.ipAddress) {
-      const rawIpKey = state.deviceInfo.ipAddress.replace(/\./g, '_');
-      const rawIpBanRef = doc(state.db, "banned_ips", rawIpKey);
-      const rawIpSnap = await getDoc(rawIpBanRef);
-      
-      if (rawIpSnap.exists()) {
-        return; // Still banned by raw IP
-      }
-    }
-    
-    // All clear - show recovery
-    state.isDeviceBanned = false;
-    showUnbannedRecoveryScreen();
-    
-  } catch (error) {
-    console.error("Error checking ban recovery:", error);
-  }
-}
-
-function showBannedScreen() {
-  document.body.innerHTML = '';
-  document.body.className = 'banned-overlay';
+  // Create unban notification overlay
+  const overlay = document.createElement('div');
+  overlay.id = 'unbanOverlayScreen';
+  overlay.style.cssText = `
+    position: fixed;
+    inset: 0;
+    background-color: #0a0a0a;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 99999;
+    gap: 1rem;
+  `;
   
   const h1 = document.createElement('h1');
-  h1.className = "text-3xl";
-  h1.textContent = "🚫 ACCESS DENIED";
+  h1.style.cssText = 'font-size: 1.875rem; color: #22c55e; font-weight: bold;';
+  h1.textContent = '✅ ACCESS RESTORED';
   
   const p = document.createElement('p');
-  p.textContent = "You have been banned from Konvo.";
+  p.style.cssText = 'color: #888; font-size: 0.875rem; text-align: center; max-width: 300px;';
+  p.textContent = 'Your ban has been lifted. Click below to continue using Konvo.';
   
-  document.body.appendChild(h1);
-  document.body.appendChild(p);
+  const btn = document.createElement('button');
+  btn.style.cssText = `
+    margin-top: 1.5rem;
+    padding: 0.75rem 2rem;
+    background-color: #22c55e;
+    color: #000;
+    border: none;
+    border-radius: 8px;
+    font-weight: bold;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: transform 0.2s, background-color 0.2s;
+  `;
+  btn.textContent = 'CONTINUE';
+  btn.onmouseover = () => btn.style.backgroundColor = '#16a34a';
+  btn.onmouseout = () => btn.style.backgroundColor = '#22c55e';
+  btn.onclick = () => window.location.reload();
+  
+  overlay.appendChild(h1);
+  overlay.appendChild(p);
+  overlay.appendChild(btn);
+  
+  document.body.appendChild(overlay);
+}
+
+
+
+function showBannedScreen() {
+  // Store original body content reference
+  const appContainer = document.getElementById('app') || document.body;
+  
+  // Hide app content instead of destroying it
+  Array.from(appContainer.children).forEach(child => {
+    if (child.id !== 'banOverlayScreen') {
+      child.style.display = 'none';
+    }
+  });
+  
+  // Remove existing ban overlay if present
+  const existingOverlay = document.getElementById('banOverlayScreen');
+  if (existingOverlay) existingOverlay.remove();
+  
+  // Create ban overlay
+  const overlay = document.createElement('div');
+  overlay.id = 'banOverlayScreen';
+  overlay.className = 'banned-overlay';
+  overlay.style.cssText = `
+    position: fixed;
+    inset: 0;
+    background-color: #0a0a0a;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 99999;
+    gap: 1rem;
+  `;
+  
+  const h1 = document.createElement('h1');
+  h1.style.cssText = 'font-size: 1.875rem; color: #ef4444; font-weight: bold;';
+  h1.textContent = '🚫 ACCESS DENIED';
+  
+  const p = document.createElement('p');
+  p.style.cssText = 'color: #888; font-size: 0.875rem;';
+  p.textContent = 'You have been banned from Konvo.';
+  
+  const p2 = document.createElement('p');
+  p2.style.cssText = 'color: #555; font-size: 0.75rem; margin-top: 1rem;';
+  p2.textContent = 'If you believe this is a mistake, please wait for admin review.';
+  
+  overlay.appendChild(h1);
+  overlay.appendChild(p);
+  overlay.appendChild(p2);
+  
+  document.body.appendChild(overlay);
 }
 
 // ============================================================
