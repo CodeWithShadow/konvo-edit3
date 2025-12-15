@@ -4,7 +4,7 @@ service cloud.firestore {
 
     // ============================================================
     // KONVO - ANONYMOUS CHAT PLATFORM SECURITY RULES
-    // Version: 3.0 (Device Fingerprinting + IP Ban System)
+    // Version: 3.1 (Device Fingerprinting + IP Ban + Auto-Ban System)
     // ============================================================
     // New Collections Added:
     // - banned_devices: Stores banned device fingerprints
@@ -230,6 +230,7 @@ service cloud.firestore {
              && data.timestamp == request.time;
     }
 
+    // UPDATED: Allow SYSTEM_AUTO_BAN
     function isValidBanRecord() {
       let data = request.resource.data;
       let requiredFields = ['bannedBy', 'timestamp'];
@@ -237,16 +238,17 @@ service cloud.firestore {
       
       return data.keys().hasAll(requiredFields)
              && data.keys().hasOnly(allAllowedFields)
-             && data.bannedBy == request.auth.uid
+             && (data.bannedBy == request.auth.uid || data.bannedBy == "SYSTEM_AUTO_BAN")
              && data.timestamp == request.time
              && (!('reason' in data) || (data.reason is string && data.reason.size() <= 500))
              && (!('username' in data) || (data.username is string && data.username.size() <= 30));
     }
 
     // ============================
-    // 3. DEVICE BAN VALIDATION (NEW)
+    // 3. DEVICE BAN VALIDATION
     // ============================
 
+    // UPDATED: Allow SYSTEM_AUTO_BAN
     function isValidDeviceBanRecord() {
       let data = request.resource.data;
       let requiredFields = ['fingerprint', 'bannedBy', 'timestamp'];
@@ -257,7 +259,7 @@ service cloud.firestore {
              && data.fingerprint is string
              && data.fingerprint.size() > 0
              && data.fingerprint.size() <= 100
-             && data.bannedBy == request.auth.uid
+             && (data.bannedBy == request.auth.uid || data.bannedBy == "SYSTEM_AUTO_BAN")
              && data.timestamp == request.time
              && (!('userId' in data) || (data.userId is string && data.userId.size() <= 128))
              && (!('username' in data) || (data.username is string && data.username.size() <= 30))
@@ -266,6 +268,7 @@ service cloud.firestore {
              && (!('platform' in data) || data.platform == null || (data.platform is string && data.platform.size() <= 100));
     }
 
+    // UPDATED: Allow SYSTEM_AUTO_BAN
     function isValidIPBanRecord() {
       let data = request.resource.data;
       let requiredFields = ['bannedBy', 'timestamp'];
@@ -273,7 +276,7 @@ service cloud.firestore {
       
       return data.keys().hasAll(requiredFields)
              && data.keys().hasOnly(allAllowedFields)
-             && data.bannedBy == request.auth.uid
+             && (data.bannedBy == request.auth.uid || data.bannedBy == "SYSTEM_AUTO_BAN")
              && data.timestamp == request.time
              && (!('ipHash' in data) || (data.ipHash is string && data.ipHash.size() <= 50))
              && (!('ipAddress' in data) || data.ipAddress == null || (data.ipAddress is string && data.ipAddress.size() <= 50))
@@ -367,7 +370,7 @@ service cloud.firestore {
     }
 
     // ============================
-    // 7. BANNED DEVICES (/banned_devices) - NEW
+    // 7. BANNED DEVICES (/banned_devices)
     // ============================
 
     match /banned_devices/{fingerprintId} {
@@ -386,7 +389,7 @@ service cloud.firestore {
     }
 
     // ============================
-    // 8. BANNED IPS (/banned_ips) - NEW
+    // 8. BANNED IPS (/banned_ips)
     // ============================
 
     match /banned_ips/{ipId} {
@@ -404,7 +407,7 @@ service cloud.firestore {
     }
 
     // ============================
-    // 9. USER DEVICES (/user_devices) - NEW
+    // 9. USER DEVICES (/user_devices)
     // ============================
 
     match /user_devices/{deviceDocId} {

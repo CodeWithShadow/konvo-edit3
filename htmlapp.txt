@@ -1,6 +1,6 @@
 // ============================================================
 // KONVO - ANONYMOUS CHAT APPLICATION
-// Version: 3.0 (Device Fingerprinting + IP Ban System)
+// Version: 3.1 (Device Fingerprinting + IP Ban System - FIXED)
 // ============================================================
 'use strict';
 
@@ -372,8 +372,8 @@ async function registerDevice(db, userId, deviceInfo) {
 function hideBanCheckOverlay() {
   const overlay = document.getElementById('banCheckOverlay');
   if (overlay) {
-    overlay.style.opacity = '0';
-    overlay.style.transition = 'opacity 0.3s ease';
+    overlay.classList.add('hidden');
+    // Use setTimeout to allow transition
     setTimeout(() => {
       overlay.style.display = 'none';
     }, 300);
@@ -387,18 +387,32 @@ function hideBanCheckOverlay() {
 function showDeviceBannedScreen(reason = 'Device banned') {
   const overlay = document.getElementById('banCheckOverlay');
   if (overlay) {
-    overlay.innerHTML = `
-      <div class="text-center">
-        <h1 class="text-3xl text-red-500 mb-4">🚫 ACCESS DENIED</h1>
-        <p class="text-[#888] text-sm mb-2">This device has been banned from Konvo.</p>
-        <p class="text-[#666] text-xs">Reason: ${sanitizeText(reason)}</p>
-      </div>
-    `;
+    // Clear existing content and add banned message
+    overlay.innerHTML = '';
+    overlay.className = 'ban-check-overlay';
+    
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'device-banned-content';
+    
+    const h1 = document.createElement('h1');
+    h1.textContent = '🚫 ACCESS DENIED';
+    
+    const p1 = document.createElement('p');
+    p1.textContent = 'This device has been banned from Konvo.';
+    
+    const p2 = document.createElement('p');
+    p2.className = 'reason';
+    p2.textContent = 'Reason: ' + sanitizeText(reason);
+    
+    contentDiv.appendChild(h1);
+    contentDiv.appendChild(p1);
+    contentDiv.appendChild(p2);
+    overlay.appendChild(contentDiv);
+    
     overlay.style.display = 'flex';
-    overlay.style.opacity = '1';
+    overlay.classList.remove('hidden');
   }
   
-  // Also set the body class
   document.body.classList.add('device-banned');
 }
 
@@ -649,12 +663,12 @@ function createKebabIcon() {
 // FIREBASE CONFIGURATION
 // ============================================================
 const firebaseConfig = {
-  apiKey: "AIzaSyDOiYfkCf3Y1Fq7625HimKsm3wYwjBWoxc",
-  authDomain: "konvo-d357d.firebaseapp.com",
-  projectId: "konvo-d357d",
-  storageBucket: "konvo-d357d.firebasestorage.app",
-  messagingSenderId: "924631278394",
-  appId: "1:924631278394:web:84b8642b5366d869926603"
+  apiKey: "AIzaSyDlijum_4JJ0V4eeE_AZS-T-ROGfby9o7Q",
+  authDomain: "konvo-endgame.firebaseapp.com",
+  projectId: "konvo-endgame",
+  storageBucket: "konvo-endgame.firebasestorage.app",
+  messagingSenderId: "297152484978",
+  appId: "1:297152484978:web:d6a2907445c6c431cb14eb"
 };
 
 const appStartTime = Date.now();
@@ -785,6 +799,7 @@ const unsubscribers = {
   pinned: () => {},
   banCheck: () => {},
   deviceBanCheck: () => {},
+  ipBanCheck: () => {},
 };
 
 // ============================================================
@@ -1114,7 +1129,7 @@ async function togglePinMessage() {
 }
 
 /**
- * Toggle ban status of a user - NOW INCLUDES DEVICE & IP BAN
+ * Toggle ban status of a user - WITH FRESH DATA CHECK AND PROPER UNBAN
  */
 async function toggleBanUser() {
   if (!state.currentContextMenuData || !state.db) return;
@@ -1127,90 +1142,127 @@ async function toggleBanUser() {
     return;
   }
 
-  const userProfile = state.userProfiles[userId] || {};
-  const isBanned = userProfile.banned === true;
+  hideDropdownMenu();
+  
+  // FIXED: Fetch fresh ban status from Firestore instead of using cache
+  let isBanned = false;
+  try {
+    const banDocRef = doc(state.db, "banned_users", userId);
+    const banDocSnap = await getDoc(banDocRef);
+    isBanned = banDocSnap.exists();
+  } catch (e) {
+    console.error("Error checking ban status:", e);
+    showToast("Error checking ban status. Please try again.", "error");
+    return;
+  }
+
   const action = isBanned ? "UNBAN" : "BAN";
   const safeUsername = sanitizeText(username || 'this user');
 
   const confirmMessage = isBanned 
-    ? `Unban ${safeUsername}? This will also unban their device and IP.`
+    ? `Unban ${safeUsername}? This will restore their access including their device and IP.`
     : `Ban ${safeUsername}? This will also ban their device fingerprint and IP address, preventing them from returning even with a new browser.`;
 
-  if (confirm(confirmMessage)) {
-    hideDropdownMenu();
+  if (!confirm(confirmMessage)) {
+    return;
+  }
+  
+  try {
+    const batch = writeBatch(state.db);
     
+    // 1. Update user document
+    const userRef = doc(state.db, "users", userId);
+    if (isBanned) {
+      // UNBANNING: Set banned to false explicitly
+      batch.update(userRef, { banned: false });
+    } else {
+      // BANNING: Set banned to true
+      batch.set(userRef, { banned: true }, { merge: true });
+    }
+    
+    // 2. Update banned_users collection
+    const banRef = doc(state.db, "banned_users", userId);
+    if (isBanned) {
+      batch.delete(banRef);
+    } else {
+      batch.set(banRef, {
+        bannedBy: state.currentUserId,
+        timestamp: serverTimestamp(),
+        reason: "Admin Action",
+        username: username?.substring(0, 30) || 'Unknown'
+      });
+    }
+    
+    // 3. Get user's device info and ban/unban devices
+    const devicesQuery = query(
+      collection(state.db, "user_devices"),
+      where("userId", "==", userId)
+    );
+    
+    let devicesSnapshot;
     try {
-      const batch = writeBatch(state.db);
+      devicesSnapshot = await getDocs(devicesQuery);
+    } catch (e) {
+      console.warn("Could not fetch user devices:", e);
+      devicesSnapshot = { docs: [] };
+    }
+    
+    const processedFingerprints = new Set();
+    const processedIPs = new Set();
+    
+    for (const deviceDoc of devicesSnapshot.docs) {
+      const deviceData = deviceDoc.data();
       
-      // 1. Update user document
-      const userRef = doc(state.db, "users", userId);
-      batch.set(userRef, { banned: !isBanned }, { merge: true });
-      
-      // 2. Update banned_users collection
-      const banRef = doc(state.db, "banned_users", userId);
-      if (isBanned) {
-        batch.delete(banRef);
-      } else {
-        batch.set(banRef, {
-          bannedBy: state.currentUserId,
-          timestamp: serverTimestamp(),
-          reason: "Admin Action",
-          username: username?.substring(0, 30) || 'Unknown'
-        });
+      // Ban/Unban fingerprint (avoid duplicates)
+      if (deviceData.fingerprint && !processedFingerprints.has(deviceData.fingerprint)) {
+        processedFingerprints.add(deviceData.fingerprint);
+        const fingerprintBanRef = doc(state.db, "banned_devices", deviceData.fingerprint);
+        
+        if (isBanned) {
+          // UNBANNING: Delete the ban document
+          batch.delete(fingerprintBanRef);
+        } else {
+          // BANNING: Create ban document
+          batch.set(fingerprintBanRef, {
+            fingerprint: deviceData.fingerprint,
+            userId: userId,
+            username: username?.substring(0, 30) || 'Unknown',
+            bannedBy: state.currentUserId,
+            timestamp: serverTimestamp(),
+            reason: "Admin Action",
+            userAgent: deviceData.userAgent || null,
+            platform: deviceData.platform || null,
+          });
+        }
       }
       
-      // 3. Get user's device info and ban/unban devices
-      const devicesQuery = query(
-        collection(state.db, "user_devices"),
-        where("userId", "==", userId)
-      );
-      
-      const devicesSnapshot = await getDocs(devicesQuery);
-      
-      for (const deviceDoc of devicesSnapshot.docs) {
-        const deviceData = deviceDoc.data();
+      // Ban/Unban IP hash (avoid duplicates)
+      if (deviceData.ipHash && !processedIPs.has(deviceData.ipHash)) {
+        processedIPs.add(deviceData.ipHash);
+        const ipBanRef = doc(state.db, "banned_ips", deviceData.ipHash);
         
-        // Ban/Unban fingerprint
-        if (deviceData.fingerprint) {
-          const fingerprintBanRef = doc(state.db, "banned_devices", deviceData.fingerprint);
-          if (isBanned) {
-            batch.delete(fingerprintBanRef);
-          } else {
-            batch.set(fingerprintBanRef, {
-              fingerprint: deviceData.fingerprint,
-              userId: userId,
-              username: username?.substring(0, 30) || 'Unknown',
-              bannedBy: state.currentUserId,
-              timestamp: serverTimestamp(),
-              reason: "Admin Action",
-              userAgent: deviceData.userAgent || null,
-              platform: deviceData.platform || null,
-            });
-          }
+        if (isBanned) {
+          batch.delete(ipBanRef);
+        } else {
+          batch.set(ipBanRef, {
+            ipHash: deviceData.ipHash,
+            ipAddress: deviceData.ipAddress || null,
+            userId: userId,
+            username: username?.substring(0, 30) || 'Unknown',
+            bannedBy: state.currentUserId,
+            timestamp: serverTimestamp(),
+            reason: "Admin Action",
+          });
         }
-        
-        // Ban/Unban IP address
-        if (deviceData.ipHash) {
-          const ipBanRef = doc(state.db, "banned_ips", deviceData.ipHash);
-          if (isBanned) {
-            batch.delete(ipBanRef);
-          } else {
-            batch.set(ipBanRef, {
-              ipHash: deviceData.ipHash,
-              ipAddress: deviceData.ipAddress || null,
-              userId: userId,
-              username: username?.substring(0, 30) || 'Unknown',
-              bannedBy: state.currentUserId,
-              timestamp: serverTimestamp(),
-              reason: "Admin Action",
-            });
-          }
-        }
-        
-        // Also ban raw IP if available
-        if (deviceData.ipAddress) {
-          const rawIpKey = deviceData.ipAddress.replace(/\./g, '_');
+      }
+      
+      // Also handle raw IP if available (avoid duplicates)
+      if (deviceData.ipAddress) {
+        const rawIpKey = deviceData.ipAddress.replace(/\./g, '_');
+        if (!processedIPs.has(rawIpKey)) {
+          processedIPs.add(rawIpKey);
           const rawIpBanRef = doc(state.db, "banned_ips", rawIpKey);
+          
           if (isBanned) {
             batch.delete(rawIpBanRef);
           } else {
@@ -1225,21 +1277,28 @@ async function toggleBanUser() {
           }
         }
       }
-      
-      await batch.commit();
-      
-      const devicesCount = devicesSnapshot.docs.length;
-      showToast(
-        `User has been ${isBanned ? "UNBANNED" : "BANNED"}. ${devicesCount} device(s) affected.`, 
-        "info"
-      );
-      
-    } catch (e) {
-      console.error('Ban error:', e);
-      showToast(`Failed to ${action} user.`, "error");
     }
-  } else {
-    hideDropdownMenu();
+    
+    await batch.commit();
+    
+    // Update local cache
+    if (state.userProfiles[userId]) {
+      state.userProfiles[userId].banned = !isBanned;
+    }
+    
+    const devicesCount = processedFingerprints.size;
+    const ipsCount = processedIPs.size;
+    
+    showToast(
+      isBanned 
+        ? `✅ User UNBANNED. Removed ${devicesCount} device ban(s) and ${ipsCount} IP ban(s).`
+        : `🚫 User BANNED. Added ${devicesCount} device ban(s) and ${ipsCount} IP ban(s).`, 
+      "info"
+    );
+    
+  } catch (e) {
+    console.error('Ban/Unban error:', e);
+    showToast(`Failed to ${action.toLowerCase()} user: ${e.message}`, "error");
   }
 }
 
@@ -1257,7 +1316,7 @@ async function initFirebase() {
 
     try {
       initializeAppCheck(state.app, {
-        provider: new ReCaptchaEnterpriseProvider('6Ldv2yYsAAAAAJhp5E6hovquodb8WoS9thyDA6hE'),
+        provider: new ReCaptchaEnterpriseProvider('6LfnNiwsAAAAAGq_faIyfph6OmKKvaEfU-c8_QIH'),
         isTokenAutoRefreshEnabled: true
       });
     } catch (appCheckError) {
@@ -1415,7 +1474,7 @@ function listenForPinnedMessages() {
 }
 
 // ============================================================
-// BAN STATUS
+// BAN STATUS - FIXED TO HANDLE UNBAN
 // ============================================================
 
 function listenForBanStatus() {
@@ -1430,11 +1489,20 @@ function listenForBanStatus() {
     doc(state.db, "banned_users", state.currentUserId), 
     (docSnap) => {
       if (docSnap.exists()) {
-        state.isBanned = true;
-        state.userProfiles = {};
-        
-        cleanupAllListeners();
-        showBannedScreen();
+        // User is banned
+        if (!state.isBanned) {
+          state.isBanned = true;
+          state.userProfiles = {};
+          cleanupAllListeners();
+          showBannedScreen();
+        }
+      } else {
+        // User is NOT banned (unbanned or never banned)
+        if (state.isBanned) {
+          state.isBanned = false;
+          // Show recovery message - user needs to refresh
+          showUnbannedRecoveryScreen();
+        }
       }
     },
     (error) => {
@@ -1444,12 +1512,17 @@ function listenForBanStatus() {
 }
 
 /**
- * Listen for device-level bans (fingerprint & IP)
+ * Listen for device-level bans (fingerprint & IP) - FIXED
  */
 function listenForDeviceBans() {
+  // Cleanup existing listeners
   if (typeof unsubscribers.deviceBanCheck === 'function') {
     unsubscribers.deviceBanCheck();
     unsubscribers.deviceBanCheck = () => {};
+  }
+  if (typeof unsubscribers.ipBanCheck === 'function') {
+    unsubscribers.ipBanCheck();
+    unsubscribers.ipBanCheck = () => {};
   }
   
   if (!state.db || !state.deviceInfo?.fingerprint) return;
@@ -1459,9 +1532,17 @@ function listenForDeviceBans() {
     doc(state.db, "banned_devices", state.deviceInfo.fingerprint), 
     (docSnap) => {
       if (docSnap.exists()) {
-        state.isDeviceBanned = true;
-        cleanupAllListeners();
-        showDeviceBannedScreen('Device fingerprint banned');
+        if (!state.isDeviceBanned) {
+          state.isDeviceBanned = true;
+          cleanupAllListeners();
+          showDeviceBannedScreen('Device fingerprint banned');
+        }
+      } else {
+        // Device is unbanned
+        if (state.isDeviceBanned) {
+          // Check if IP is also unbanned before recovering
+          checkAndRecoverFromBan();
+        }
       }
     },
     (error) => {
@@ -1469,21 +1550,119 @@ function listenForDeviceBans() {
     }
   );
   
-  // Also listen for IP ban if we have an IP
+  // Listen for IP ban - NOW STORED PROPERLY
   if (state.deviceInfo.ipHash) {
-    onSnapshot(
+    unsubscribers.ipBanCheck = onSnapshot(
       doc(state.db, "banned_ips", state.deviceInfo.ipHash), 
       (docSnap) => {
         if (docSnap.exists()) {
-          state.isDeviceBanned = true;
-          cleanupAllListeners();
-          showDeviceBannedScreen('IP address banned');
+          if (!state.isDeviceBanned) {
+            state.isDeviceBanned = true;
+            cleanupAllListeners();
+            showDeviceBannedScreen('IP address banned');
+          }
+        } else {
+          // IP is unbanned - check if fingerprint is also unbanned
+          if (state.isDeviceBanned) {
+            checkAndRecoverFromBan();
+          }
         }
       },
       (error) => {
         console.warn("IP ban check error:", error);
       }
     );
+  }
+}
+
+/**
+ * Show recovery screen when user is unbanned
+ * User needs to refresh to continue using the app
+ */
+function showUnbannedRecoveryScreen() {
+  // If body was replaced with banned screen, show recovery
+  const existingContent = document.getElementById('feedContainer');
+  
+  if (!existingContent) {
+    // Body was replaced, show recovery screen
+    document.body.innerHTML = '';
+    document.body.className = 'banned-overlay';
+    document.body.style.background = '#0a0a0a';
+    
+    const container = document.createElement('div');
+    container.className = 'text-center p-6';
+    
+    const h1 = document.createElement('h1');
+    h1.className = 'text-3xl mb-4';
+    h1.style.color = '#22c55e';
+    h1.textContent = '✅ ACCESS RESTORED';
+    
+    const p = document.createElement('p');
+    p.style.color = '#888';
+    p.className = 'mb-6';
+    p.textContent = 'Your ban has been lifted. Please refresh to continue.';
+    
+    const btn = document.createElement('button');
+    btn.className = 'px-6 py-3 bg-white text-black rounded-lg font-bold';
+    btn.style.cursor = 'pointer';
+    btn.textContent = 'REFRESH PAGE';
+    btn.onclick = () => window.location.reload();
+    
+    container.appendChild(h1);
+    container.appendChild(p);
+    container.appendChild(btn);
+    document.body.appendChild(container);
+  } else {
+    // App is still intact, just reset state
+    state.isBanned = false;
+    state.isDeviceBanned = false;
+  }
+}
+
+/**
+ * Check if device is fully unbanned and recover
+ */
+async function checkAndRecoverFromBan() {
+  if (!state.db || !state.deviceInfo) return;
+  
+  try {
+    // Check fingerprint ban
+    if (state.deviceInfo.fingerprint) {
+      const fingerprintBanRef = doc(state.db, "banned_devices", state.deviceInfo.fingerprint);
+      const fingerprintSnap = await getDoc(fingerprintBanRef);
+      
+      if (fingerprintSnap.exists()) {
+        return; // Still banned by fingerprint
+      }
+    }
+    
+    // Check IP ban
+    if (state.deviceInfo.ipHash) {
+      const ipBanRef = doc(state.db, "banned_ips", state.deviceInfo.ipHash);
+      const ipSnap = await getDoc(ipBanRef);
+      
+      if (ipSnap.exists()) {
+        return; // Still banned by IP
+      }
+    }
+    
+    // Check raw IP ban
+    if (state.deviceInfo.ipAddress) {
+      const rawIpKey = state.deviceInfo.ipAddress.replace(/\./g, '_');
+      const rawIpBanRef = doc(state.db, "banned_ips", rawIpKey);
+      const rawIpSnap = await getDoc(rawIpBanRef);
+      
+      if (rawIpSnap.exists()) {
+        return; // Still banned by raw IP
+      }
+    }
+    
+    // All clear - show recovery
+    state.isDeviceBanned = false;
+    showUnbannedRecoveryScreen();
+    
+  } catch (error) {
+    console.error("Error checking ban recovery:", error);
   }
 }
 
@@ -1920,6 +2099,7 @@ function showConfirmModal(text, isMine, docId) {
     };
     
     confirmModalActionContainer.appendChild(btnForMe);
+    confirmModalActionContainer.appendChild(btnEveryone);
   } else {
     const btnForMe = document.createElement('button');
     btnForMe.type = 'button';
@@ -1980,7 +2160,7 @@ async function toggleReaction(docId, collectionName, reactionType, hasReacted) {
 }
 
 // ============================================================
-// CONTEXT MENU
+// CONTEXT MENU (continued)
 // ============================================================
 
 function showDropdownMenu(event, data) {
@@ -2021,12 +2201,27 @@ function showDropdownMenu(event, data) {
   
   if (menuBan) {
     menuBan.style.display = (isAdmin && !isMine) ? "block" : "none";
-    const userProfile = state.userProfiles[data.userId] || {};
-    const isBanned = userProfile.banned === true;
-    menuBan.textContent = isBanned ? "Unban User ✅" : "Ban User 🚫";
-    menuBan.className = isBanned
-      ? "text-green-500 hover:text-green-400 font-bold border-t border-[#333] mt-1 pt-1"
-      : "text-red-500 hover:text-red-400 font-bold border-t border-[#333] mt-1 pt-1";
+    
+    // FIXED: Fetch fresh ban status instead of using cached data
+    if (isAdmin && !isMine && data.userId) {
+      // Update the menu text asynchronously
+      (async () => {
+        try {
+          const banDocRef = doc(state.db, "banned_users", data.userId);
+          const banDocSnap = await getDoc(banDocRef);
+          const isBanned = banDocSnap.exists();
+          
+          if (menuBan) {
+            menuBan.textContent = isBanned ? "Unban User ✅" : "Ban User 🚫";
+            menuBan.className = isBanned
+              ? "text-green-500 hover:text-green-400 font-bold border-t border-[#333] mt-1 pt-1"
+              : "text-red-500 hover:text-red-400 font-bold border-t border-[#333] mt-1 pt-1";
+          }
+        } catch (e) {
+          console.warn("Could not check ban status for menu:", e);
+        }
+      })();
+    }
   }
   
   const rect = event.currentTarget.getBoundingClientRect();
@@ -2418,13 +2613,13 @@ function listenForTyping() {
         const data = docSnap.data();
         const oduserId = docSnap.id;
         
-        if (userId === state.currentUserId) return;
+        if (oduserId === state.currentUserId) return;
         
         if (data.isTyping && data.timestamp) {
           const timeSinceTyping = now - data.timestamp;
           
           if (timeSinceTyping < TYPING_STALE_THRESHOLD) {
-            const username = state.userProfiles[userId]?.username || "Someone";
+            const username = state.userProfiles[oduserId]?.username || "Someone";
             typingUsers.push(username);
           }
         }
@@ -2912,7 +3107,6 @@ async function postMessage(collectionRef, input) {
   if (submitBtn) {
     submitBtn.disabled = true;
     submitBtn.classList.add('loading');
-    const originalText = submitBtn.textContent;
     submitBtn.textContent = 'SENDING...';
   }
   
@@ -3171,4 +3365,3 @@ initFirebase().catch(err => {
   setTextSafely(loading, "Error: Failed to initialize. Please refresh the page.");
   hideBanCheckOverlay();
 });
-    
