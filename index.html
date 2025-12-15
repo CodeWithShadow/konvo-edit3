@@ -45,15 +45,9 @@
   
   <body class="flex flex-col bg-[#0a0a0a] h-dvh">
     <!-- Ban Check Overlay (shows while checking device status) -->
-    <div 
-      id="banCheckOverlay" 
-      class="fixed inset-0 bg-[#0a0a0a] z-[99999] flex items-center justify-center"
-      style="display: flex;"
-    >
+    <div id="banCheckOverlay" class="ban-check-overlay">
       <div class="text-center">
-        <div class="text-[#888] text-sm" style="animation: systemPulse 2s ease-in-out infinite;">
-          VERIFYING ACCESS...
-        </div>
+        <div class="ban-check-text">VERIFYING ACCESS...</div>
       </div>
     </div>
 
@@ -472,10 +466,7 @@
     </div>
 
     <!-- FingerprintJS CDN -->
-    <script 
-      src="https://cdn.jsdelivr.net/npm/@fingerprintjs/fingerprintjs@3/dist/fp.min.js"
-      async
-    ></script>
+    <script src="https://cdn.jsdelivr.net/npm/@fingerprintjs/fingerprintjs@3/dist/fp.min.js"></script>
 
     <!-- App Script -->
     <script type="module" src="app.js"></script>

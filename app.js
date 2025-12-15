@@ -1,26 +1,21 @@
+
 // ============================================================
 // KONVO - ANONYMOUS CHAT APPLICATION
-// Version: 2.3 (Character Counter + On-Demand Profile Loading)
+// Version: 3.0 (Device Fingerprinting + IP Ban System)
 // ============================================================
 'use strict';
 
 // ============================================================
 // VIEWPORT HEIGHT FIX (MOBILE + INSTALLED PWA)
 // ============================================================
-// On iOS/Android (especially in standalone/PWA mode), the on-screen keyboard can shrink the
-// *visual* viewport without reliable support for CSS viewport units. This keeps the chat input
-// from being pushed below the visible area (requiring scroll to type).
 (function setupAppHeight() {
   const apply = () => {
     const h = window.visualViewport?.height || window.innerHeight;
     document.documentElement.style.setProperty('--app-height', `${h}px`);
-    // Inline style beats Tailwind height utilities on <body>
     if (document.body) document.body.style.height = `${h}px`;
   };
 
   apply();
-
-  // Update on rotation/resize and keyboard open/close
   window.addEventListener('resize', apply);
   window.visualViewport?.addEventListener('resize', apply);
   window.visualViewport?.addEventListener('scroll', apply);
@@ -57,6 +52,372 @@ import {
 } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
 // ============================================================
+// DEVICE IDENTIFICATION SYSTEM
+// ============================================================
+
+/**
+ * Device identification state
+ */
+const deviceState = {
+  fingerprint: null,
+  ipAddress: null,
+  isIdentified: false,
+  isBannedDevice: false,
+};
+
+/**
+ * Generate device fingerprint using FingerprintJS
+ * @returns {Promise<string>} - Device fingerprint ID
+ */
+async function generateDeviceFingerprint() {
+  try {
+    // Check if FingerprintJS is loaded
+    if (typeof FingerprintJS === 'undefined') {
+      console.warn('FingerprintJS not loaded, using fallback');
+      return generateFallbackFingerprint();
+    }
+    
+    const fp = await FingerprintJS.load();
+    const result = await fp.get();
+    
+    // The visitorId is a stable identifier
+    deviceState.fingerprint = result.visitorId;
+    console.log('Device fingerprint generated');
+    
+    return result.visitorId;
+  } catch (error) {
+    console.error('Fingerprint generation error:', error);
+    return generateFallbackFingerprint();
+  }
+}
+
+/**
+ * Fallback fingerprint generation if FingerprintJS fails
+ * @returns {string} - Fallback fingerprint
+ */
+function generateFallbackFingerprint() {
+  const components = [
+    navigator.userAgent,
+    navigator.language,
+    screen.width + 'x' + screen.height,
+    screen.colorDepth,
+    new Date().getTimezoneOffset(),
+    navigator.hardwareConcurrency || 'unknown',
+    navigator.deviceMemory || 'unknown',
+    navigator.platform,
+  ];
+  
+  // Create a hash from components
+  let hash = 0;
+  const str = components.join('|||');
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  
+  const fallbackId = 'fb_' + Math.abs(hash).toString(36) + '_' + Date.now().toString(36);
+  deviceState.fingerprint = fallbackId;
+  
+  return fallbackId;
+}
+
+/**
+ * Get user's IP address using multiple fallback services
+ * @returns {Promise<string|null>} - IP address or null
+ */
+async function getUserIPAddress() {
+  const ipServices = [
+    'https://api.ipify.org?format=json',
+    'https://api.ip.sb/ip',
+    'https://api64.ipify.org?format=json',
+  ];
+  
+  for (const service of ipServices) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      
+      const response = await fetch(service, { 
+        signal: controller.signal,
+        mode: 'cors'
+      });
+      
+      clearTimeout(timeout);
+      
+      if (response.ok) {
+        const text = await response.text();
+        
+        // Try to parse as JSON first
+        try {
+          const json = JSON.parse(text);
+          const ip = json.ip || json.query || json.ipAddress;
+          if (ip && isValidIP(ip)) {
+            deviceState.ipAddress = ip;
+            console.log('IP address retrieved');
+            return ip;
+          }
+        } catch {
+          // Not JSON, use raw text
+          const ip = text.trim();
+          if (isValidIP(ip)) {
+            deviceState.ipAddress = ip;
+            console.log('IP address retrieved');
+            return ip;
+          }
+        }
+      }
+    } catch (error) {
+      console.warn(`IP service ${service} failed:`, error.message);
+    }
+  }
+  
+  console.warn('Could not retrieve IP address');
+  return null;
+}
+
+/**
+ * Validate IP address format
+ * @param {string} ip - IP address to validate
+ * @returns {boolean} - Whether IP is valid
+ */
+function isValidIP(ip) {
+  if (!ip || typeof ip !== 'string') return false;
+  
+  // IPv4 pattern
+  const ipv4Pattern = /^(\d{1,3}\.){3}\d{1,3}$/;
+  
+  // IPv6 pattern (simplified)
+  const ipv6Pattern = /^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^([0-9a-fA-F]{1,4}:)*:([0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}$|^::$/;
+  
+  if (ipv4Pattern.test(ip)) {
+    const parts = ip.split('.').map(Number);
+    return parts.every(part => part >= 0 && part <= 255);
+  }
+  
+  return ipv6Pattern.test(ip);
+}
+
+/**
+ * Hash an IP address for storage (privacy consideration)
+ * @param {string} ip - IP address
+ * @returns {string} - Hashed IP
+ */
+function hashIP(ip) {
+  if (!ip) return '';
+  
+  let hash = 0;
+  for (let i = 0; i < ip.length; i++) {
+    const char = ip.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  
+  return 'ip_' + Math.abs(hash).toString(36);
+}
+
+/**
+ * Initialize device identification
+ * @returns {Promise<Object>} - Device info object
+ */
+async function initializeDeviceIdentification() {
+  try {
+    // Generate fingerprint and get IP in parallel
+    const [fingerprint, ipAddress] = await Promise.all([
+      generateDeviceFingerprint(),
+      getUserIPAddress()
+    ]);
+    
+    deviceState.fingerprint = fingerprint;
+    deviceState.ipAddress = ipAddress;
+    deviceState.isIdentified = true;
+    
+    return {
+      fingerprint,
+      ipAddress,
+      ipHash: hashIP(ipAddress),
+      userAgent: navigator.userAgent,
+      language: navigator.language,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      screenResolution: `${screen.width}x${screen.height}`,
+      platform: navigator.platform,
+    };
+  } catch (error) {
+    console.error('Device identification error:', error);
+    
+    // Return minimal info on error
+    return {
+      fingerprint: generateFallbackFingerprint(),
+      ipAddress: null,
+      ipHash: null,
+      userAgent: navigator.userAgent,
+      language: navigator.language,
+      timezone: null,
+      screenResolution: `${screen.width}x${screen.height}`,
+      platform: navigator.platform,
+    };
+  }
+}
+
+/**
+ * Check if device is banned
+ * @param {Object} db - Firestore database instance
+ * @param {Object} deviceInfo - Device information object
+ * @returns {Promise<Object>} - Ban check result
+ */
+async function checkDeviceBan(db, deviceInfo) {
+  if (!db || !deviceInfo) {
+    return { isBanned: false, reason: null };
+  }
+  
+  try {
+    // Check fingerprint ban
+    if (deviceInfo.fingerprint) {
+      const fingerprintBanRef = doc(db, "banned_devices", deviceInfo.fingerprint);
+      const fingerprintBanSnap = await getDoc(fingerprintBanRef);
+      
+      if (fingerprintBanSnap.exists()) {
+        const banData = fingerprintBanSnap.data();
+        return { 
+          isBanned: true, 
+          reason: 'Device banned',
+          bannedAt: banData.timestamp,
+          banType: 'fingerprint'
+        };
+      }
+    }
+    
+    // Check IP ban
+    if (deviceInfo.ipAddress) {
+      const ipHash = hashIP(deviceInfo.ipAddress);
+      const ipBanRef = doc(db, "banned_ips", ipHash);
+      const ipBanSnap = await getDoc(ipBanRef);
+      
+      if (ipBanSnap.exists()) {
+        const banData = ipBanSnap.data();
+        return { 
+          isBanned: true, 
+          reason: 'IP address banned',
+          bannedAt: banData.timestamp,
+          banType: 'ip'
+        };
+      }
+      
+      // Also check raw IP (for backward compatibility)
+      const rawIpBanRef = doc(db, "banned_ips", deviceInfo.ipAddress.replace(/\./g, '_'));
+      const rawIpBanSnap = await getDoc(rawIpBanRef);
+      
+      if (rawIpBanSnap.exists()) {
+        return { 
+          isBanned: true, 
+          reason: 'IP address banned',
+          banType: 'ip'
+        };
+      }
+    }
+    
+    return { isBanned: false, reason: null };
+    
+  } catch (error) {
+    console.error('Ban check error:', error);
+    // On error, allow access but log the issue
+    return { isBanned: false, reason: null, error: error.message };
+  }
+}
+
+/**
+ * Register device in database
+ * @param {Object} db - Firestore database instance
+ * @param {string} userId - User ID
+ * @param {Object} deviceInfo - Device information
+ */
+async function registerDevice(db, userId, deviceInfo) {
+  if (!db || !userId || !deviceInfo) return;
+  
+  try {
+    const deviceRef = doc(db, "user_devices", `${userId}_${deviceInfo.fingerprint}`);
+    
+    await setDoc(deviceRef, {
+      userId: userId,
+      fingerprint: deviceInfo.fingerprint,
+      ipAddress: deviceInfo.ipAddress,
+      ipHash: deviceInfo.ipHash,
+      userAgent: deviceInfo.userAgent,
+      language: deviceInfo.language,
+      timezone: deviceInfo.timezone,
+      screenResolution: deviceInfo.screenResolution,
+      platform: deviceInfo.platform,
+      firstSeen: serverTimestamp(),
+      lastSeen: serverTimestamp(),
+    }, { merge: true });
+    
+    // Also update last seen on existing record
+    await updateDoc(deviceRef, {
+      lastSeen: serverTimestamp(),
+      ipAddress: deviceInfo.ipAddress, // Update IP in case it changed
+      ipHash: deviceInfo.ipHash,
+    }).catch(() => {
+      // Ignore if document doesn't exist for update
+    });
+    
+    console.log('Device registered');
+    
+  } catch (error) {
+    console.error('Device registration error:', error);
+  }
+}
+
+/**
+ * Hide the ban check overlay
+ */
+function hideBanCheckOverlay() {
+  const overlay = document.getElementById('banCheckOverlay');
+  if (overlay) {
+    overlay.classList.add('hidden');
+    // Use setTimeout to allow transition
+    setTimeout(() => {
+      overlay.style.display = 'none';
+    }, 300);
+  }
+}
+
+/**
+ * Show device banned screen
+ * @param {string} reason - Ban reason
+ */
+function showDeviceBannedScreen(reason = 'Device banned') {
+  const overlay = document.getElementById('banCheckOverlay');
+  if (overlay) {
+    // Clear existing content and add banned message
+    overlay.innerHTML = '';
+    overlay.className = 'ban-check-overlay';
+    
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'device-banned-content';
+    
+    const h1 = document.createElement('h1');
+    h1.textContent = '🚫 ACCESS DENIED';
+    
+    const p1 = document.createElement('p');
+    p1.textContent = 'This device has been banned from Konvo.';
+    
+    const p2 = document.createElement('p');
+    p2.className = 'reason';
+    p2.textContent = 'Reason: ' + sanitizeText(reason);
+    
+    contentDiv.appendChild(h1);
+    contentDiv.appendChild(p1);
+    contentDiv.appendChild(p2);
+    overlay.appendChild(contentDiv);
+    
+    overlay.style.display = 'flex';
+    overlay.classList.remove('hidden');
+  }
+  
+  document.body.classList.add('device-banned');
+}
+
+// ============================================================
 // SECURITY UTILITIES
 // ============================================================
 
@@ -87,14 +448,12 @@ function isValidUsername(username) {
   const trimmed = username.trim();
   if (trimmed.length === 0 || trimmed.length > 30) return false;
   
-  // Reserved usernames check
   const reserved = ['anonymous', 'admin', 'moderator', 'system', 'konvo', 'mod'];
   const lowerUsername = trimmed.toLowerCase();
   if (reserved.some(r => lowerUsername === r || lowerUsername.includes(r))) {
     return false;
   }
   
-  // Only allow alphanumeric, spaces, underscores, hyphens
   const usernameRegex = /^[A-Za-z0-9_\- ]+$/;
   return usernameRegex.test(trimmed);
 }
@@ -109,7 +468,6 @@ function isValidMessageText(text) {
   const trimmed = text.trim();
   if (trimmed.length === 0 || trimmed.length > MESSAGE_MAX_LENGTH) return false;
   
-  // Check for null bytes and control characters
   const controlCharRegex = /[\x00-\x08\x0B\x0C\x0E-\x1F]/;
   return !controlCharRegex.test(trimmed);
 }
@@ -152,7 +510,6 @@ function validateMessageBeforePost(text) {
     return { valid: false, error: `Message too long (max ${MESSAGE_MAX_LENGTH} characters)` };
   }
   
-  // Check for control characters
   const controlCharRegex = /[\x00-\x08\x0B\x0C\x0E-\x1F]/;
   if (controlCharRegex.test(trimmed)) {
     return { valid: false, error: "Message contains invalid characters" };
@@ -230,10 +587,6 @@ function escapeSelector(selector) {
 // SVG ICON CREATORS (XSS-Safe)
 // ============================================================
 
-/**
- * Create notification bell icon (enabled state)
- * @returns {SVGElement}
- */
 function createEnabledBellIcon() {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("width", "18");
@@ -257,10 +610,6 @@ function createEnabledBellIcon() {
   return svg;
 }
 
-/**
- * Create notification bell icon (disabled state)
- * @returns {SVGElement}
- */
 function createDisabledBellIcon() {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("width", "18");
@@ -296,10 +645,6 @@ function createDisabledBellIcon() {
   return svg;
 }
 
-/**
- * Create kebab menu icon
- * @returns {SVGElement}
- */
 function createKebabIcon() {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("width", "14");
@@ -327,80 +672,55 @@ const firebaseConfig = {
   appId: "1:924631278394:web:84b8642b5366d869926603"
 };
 
-// App start time for determining new messages
 const appStartTime = Date.now();
 
 // ============================================================
 // DOM ELEMENTS
 // ============================================================
 const elements = {
-  // Containers
   feedContainer: document.getElementById("feedContainer"),
   loading: document.getElementById("loading"),
-  
-  // Navigation
   navConfessions: document.getElementById("navConfessions"),
   navChat: document.getElementById("navChat"),
-  
-  // Forms
   confessionForm: document.getElementById("confessionForm"),
   confessionInput: document.getElementById("confessionInput"),
   chatForm: document.getElementById("chatForm"),
   chatInput: document.getElementById("chatInput"),
-  
-  // Character Counters (NEW)
   chatCharCount: document.getElementById("chatCharCount"),
   confessionCharCount: document.getElementById("confessionCharCount"),
-  
-  // Typing & Pinned
   typingIndicator: document.getElementById("typingIndicator"),
   pinnedMessageBar: document.getElementById("pinnedMessageBar"),
   pinnedMessageText: document.getElementById("pinnedMessageText"),
-  
-  // Scroll
   scrollToBottomBtn: document.getElementById("scrollToBottomBtn"),
   newMsgCount: document.getElementById("newMsgCount"),
-  
-  // Profile Modal
   profileButton: document.getElementById("profileButton"),
   notificationButton: document.getElementById("notificationButton"),
   profileModal: document.getElementById("profileModal"),
   modalCloseButton: document.getElementById("modalCloseButton"),
   modalSaveButton: document.getElementById("modalSaveButton"),
   modalUsernameInput: document.getElementById("modalUsernameInput"),
-  
-  // Edit Modal
   editModal: document.getElementById("editModal"),
   modalEditTextArea: document.getElementById("modalEditTextArea"),
   editModalCancelButton: document.getElementById("editModalCancelButton"),
   editModalSaveButton: document.getElementById("editModalSaveButton"),
-  
-  // Confirm Modal
   confirmModal: document.getElementById("confirmModal"),
   confirmModalText: document.getElementById("confirmModalText"),
   confirmModalNoButton: document.getElementById("confirmModalNoButton"),
   confirmModalActionContainer: document.getElementById("confirmModalActionContainer"),
-  
-  // Context Menu
   contextMenu: document.getElementById("contextMenu"),
   menuEdit: document.getElementById("menuEdit"),
   menuDelete: document.getElementById("menuDelete"),
   menuSelect: document.getElementById("menuSelect"),
-  
-  // Selection Bar
   selectionBar: document.getElementById("selectionBar"),
   selectionCount: document.getElementById("selectionCount"),
   selectionCancel: document.getElementById("selectionCancel"),
   selectionDelete: document.getElementById("selectionDelete"),
-  
-  // Reply Bar
   replyBar: document.getElementById("replyBar"),
   replyAuthor: document.getElementById("replyAuthor"),
   replyText: document.getElementById("replyText"),
   cancelReply: document.getElementById("cancelReply"),
 };
 
-// Destructure for convenience
 const {
   feedContainer, loading, navConfessions, navChat,
   confessionForm, confessionInput, chatForm, chatInput,
@@ -415,7 +735,6 @@ const {
   replyBar, replyAuthor, replyText, cancelReply
 } = elements;
 
-// Dynamic menu items (created at runtime)
 let menuPin = null;
 let menuBan = null;
 
@@ -423,65 +742,56 @@ let menuBan = null;
 // STATE MANAGEMENT
 // ============================================================
 const state = {
-  // Firebase instances
   app: null,
   db: null,
   auth: null,
   
-  // User state
   currentUserId: null,
   currentUsername: "Anonymous",
   currentProfilePhotoURL: null,
   isCurrentUserAdmin: false,
   
-  // Data caches
+  // Device tracking
+  deviceInfo: null,
+  
   userProfiles: {},
   lastConfessionDocs: [],
   lastChatDocs: [],
   
-  // Profile loading state (NEW - for on-demand loading)
   pendingProfileLoads: new Set(),
   profileLoadTimeout: null,
   
-  // Collections
   confessionsCollection: null,
   chatCollection: null,
   typingStatusCollection: null,
   
-  // Current page
   currentPage: "chat",
   
-  // UI state
   isSelectionMode: false,
   selectedMessages: new Set(),
   currentContextMenuData: null,
   replyToMessage: null,
   notificationsEnabled: false,
   
-  // Scroll state
   unreadMessages: 0,
   userIsAtBottom: true,
   bottomObserver: null,
   
-  // Edit state
   docToEditId: null,
   collectionToEdit: null,
   
-  // Typing state
   typingTimeout: null,
   
-  // Flags
   isInitialized: false,
   isBanned: false,
+  isDeviceBanned: false,
 };
 
-// Rate limit tracking
 const rateLimitState = {
   lastMessageTime: 0,
   isRateLimited: false
 };
 
-// Unsubscribe functions
 const unsubscribers = {
   confessions: () => {},
   chat: () => {},
@@ -489,6 +799,7 @@ const unsubscribers = {
   typingStatus: () => {},
   pinned: () => {},
   banCheck: () => {},
+  deviceBanCheck: () => {},
 };
 
 // ============================================================
@@ -520,11 +831,6 @@ const TYPING_STALE_THRESHOLD = 5000;
 // UTILITY FUNCTIONS
 // ============================================================
 
-/**
- * Generate consistent color for user ID
- * @param {string} userId - User ID
- * @returns {string} - Hex color
- */
 function getUserColor(userId) {
   if (!userId || typeof userId !== 'string') return USER_COLORS[0];
   let hash = 0;
@@ -535,11 +841,6 @@ function getUserColor(userId) {
   return USER_COLORS[index];
 }
 
-/**
- * Format message timestamp
- * @param {Date} date - Message date
- * @returns {string} - Formatted time string
- */
 function formatMessageTime(date) {
   if (!(date instanceof Date) || isNaN(date)) {
     return 'Just now';
@@ -558,11 +859,6 @@ function formatMessageTime(date) {
   });
 }
 
-/**
- * Get date header text
- * @param {Date} date - Date to format
- * @returns {string} - Header text
- */
 function getDateHeader(date) {
   if (!(date instanceof Date) || isNaN(date)) {
     return 'Today';
@@ -582,11 +878,6 @@ function getDateHeader(date) {
   });
 }
 
-/**
- * Show toast/alert message
- * @param {string} message - Message to show
- * @param {string} type - Type of message (error, success, info)
- */
 function showToast(message, type = 'info') {
   console.log(`[${type.toUpperCase()}]:`, message);
   if (type === 'error') {
@@ -594,10 +885,6 @@ function showToast(message, type = 'info') {
   }
 }
 
-/**
- * Create action container for confirm modal if needed
- * @returns {HTMLElement|null}
- */
 function createActionContainer() {
   const existingYesBtn = document.getElementById("confirmModalYesButton");
   if (existingYesBtn && existingYesBtn.parentNode) {
@@ -610,9 +897,6 @@ function createActionContainer() {
   return confirmModalActionContainer;
 }
 
-/**
- * Clean up all Firebase listeners
- */
 function cleanupAllListeners() {
   Object.entries(unsubscribers).forEach(([key, unsub]) => {
     if (typeof unsub === 'function') {
@@ -626,38 +910,27 @@ function cleanupAllListeners() {
   });
 }
 
-/**
- * Update character counter for an input (NEW)
- * @param {HTMLTextAreaElement} input - The textarea element
- * @param {HTMLElement} counter - The counter element
- */
 function updateCharacterCounter(input, counter) {
   if (!input || !counter) return;
   
   const currentLength = input.value.length;
   const maxLength = MESSAGE_MAX_LENGTH;
   
-  // Update text
   counter.textContent = `${currentLength}/${maxLength}`;
   
-  // Show counter if there's content
   if (currentLength > 0) {
     counter.classList.add('visible');
   } else {
     counter.classList.remove('visible');
   }
   
-  // Remove all state classes first
   counter.classList.remove('warning', 'danger', 'limit');
   
-  // Add appropriate state class
   if (currentLength >= maxLength) {
     counter.classList.add('limit');
   } else if (currentLength >= maxLength * 0.95) {
-    // 95%+ = danger
     counter.classList.add('danger');
   } else if (currentLength >= maxLength * 0.8) {
-    // 80%+ = warning
     counter.classList.add('warning');
   }
 }
@@ -666,16 +939,12 @@ function updateCharacterCounter(input, counter) {
 // SERVICE WORKER REGISTRATION
 // ============================================================
 
-/**
- * Register service worker for PWA capabilities
- */
 function registerServiceWorker() {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js', { scope: '/' })
       .then(reg => {
         console.log('SW registered:', reg.scope);
         
-        // Check for updates
         reg.addEventListener('updatefound', () => {
           const newWorker = reg.installing;
           if (newWorker) {
@@ -695,9 +964,6 @@ function registerServiceWorker() {
 // CONNECTION MONITORING
 // ============================================================
 
-/**
- * Setup connection status monitoring
- */
 function setupConnectionMonitor() {
   window.addEventListener('online', () => {
     console.log('Connection restored');
@@ -716,15 +982,11 @@ function setupConnectionMonitor() {
 // NOTIFICATION FUNCTIONS
 // ============================================================
 
-/**
- * Setup notification button and permissions
- */
 function setupNotificationButton() {
   if (!notificationButton) return;
   
   notificationButton.addEventListener("click", handleNotificationClick);
   
-  // Check existing permission
   if ("Notification" in window && Notification.permission === "granted") {
     state.notificationsEnabled = true;
   }
@@ -732,10 +994,6 @@ function setupNotificationButton() {
   updateNotificationIcon();
 }
 
-/**
- * Handle notification button click
- * @param {Event} e - Click event
- */
 async function handleNotificationClick(e) {
   e.preventDefault();
   e.stopPropagation();
@@ -763,13 +1021,9 @@ async function handleNotificationClick(e) {
   }
 }
 
-/**
- * Update notification button icon based on state
- */
 function updateNotificationIcon() {
   if (!notificationButton) return;
   
-  // Clear existing content safely
   notificationButton.innerHTML = '';
   
   if (state.notificationsEnabled) {
@@ -783,11 +1037,6 @@ function updateNotificationIcon() {
   }
 }
 
-/**
- * Show a notification
- * @param {string} title - Notification title
- * @param {string} body - Notification body
- */
 async function showNotification(title, body) {
   if (!("Notification" in window) || !state.notificationsEnabled) return;
   if (document.visibilityState === 'visible') return;
@@ -820,14 +1069,10 @@ async function showNotification(title, body) {
 // ADMIN FUNCTIONS
 // ============================================================
 
-/**
- * Setup admin-specific menu items
- */
 function setupAdminMenu() {
   const ul = contextMenu?.querySelector("ul");
   if (!ul || document.getElementById("menuPin")) return;
 
-  // Create Pin menu item
   menuPin = document.createElement("li");
   menuPin.id = "menuPin";
   menuPin.setAttribute("role", "menuitem");
@@ -839,7 +1084,6 @@ function setupAdminMenu() {
     ul.insertBefore(menuPin, menuDelete);
   }
 
-  // Create Ban menu item
   menuBan = document.createElement("li");
   menuBan.id = "menuBan";
   menuBan.className = "text-red-500 hover:text-red-400 font-bold border-t border-[#333] mt-1 pt-1";
@@ -850,9 +1094,6 @@ function setupAdminMenu() {
   ul.appendChild(menuBan);
 }
 
-/**
- * Toggle pin status of a message
- */
 async function togglePinMessage() {
   if (!state.currentContextMenuData || !state.db) return;
   
@@ -888,7 +1129,7 @@ async function togglePinMessage() {
 }
 
 /**
- * Toggle ban status of a user
+ * Toggle ban status of a user - NOW INCLUDES DEVICE & IP BAN
  */
 async function toggleBanUser() {
   if (!state.currentContextMenuData || !state.db) return;
@@ -906,15 +1147,21 @@ async function toggleBanUser() {
   const action = isBanned ? "UNBAN" : "BAN";
   const safeUsername = sanitizeText(username || 'this user');
 
-  if (confirm(`Are you sure you want to ${action} ${safeUsername}?`)) {
+  const confirmMessage = isBanned 
+    ? `Unban ${safeUsername}? This will also unban their device and IP.`
+    : `Ban ${safeUsername}? This will also ban their device fingerprint and IP address, preventing them from returning even with a new browser.`;
+
+  if (confirm(confirmMessage)) {
     hideDropdownMenu();
     
     try {
       const batch = writeBatch(state.db);
-      const userRef = doc(state.db, "users", userId);
       
+      // 1. Update user document
+      const userRef = doc(state.db, "users", userId);
       batch.set(userRef, { banned: !isBanned }, { merge: true });
       
+      // 2. Update banned_users collection
       const banRef = doc(state.db, "banned_users", userId);
       if (isBanned) {
         batch.delete(banRef);
@@ -927,8 +1174,80 @@ async function toggleBanUser() {
         });
       }
       
+      // 3. Get user's device info and ban/unban devices
+      const devicesQuery = query(
+        collection(state.db, "user_devices"),
+        where("userId", "==", userId)
+      );
+      
+      const devicesSnapshot = await getDocs(devicesQuery);
+      
+      for (const deviceDoc of devicesSnapshot.docs) {
+        const deviceData = deviceDoc.data();
+        
+        // Ban/Unban fingerprint
+        if (deviceData.fingerprint) {
+          const fingerprintBanRef = doc(state.db, "banned_devices", deviceData.fingerprint);
+          if (isBanned) {
+            batch.delete(fingerprintBanRef);
+          } else {
+            batch.set(fingerprintBanRef, {
+              fingerprint: deviceData.fingerprint,
+              userId: userId,
+              username: username?.substring(0, 30) || 'Unknown',
+              bannedBy: state.currentUserId,
+              timestamp: serverTimestamp(),
+              reason: "Admin Action",
+              userAgent: deviceData.userAgent || null,
+              platform: deviceData.platform || null,
+            });
+          }
+        }
+        
+        // Ban/Unban IP address
+        if (deviceData.ipHash) {
+          const ipBanRef = doc(state.db, "banned_ips", deviceData.ipHash);
+          if (isBanned) {
+            batch.delete(ipBanRef);
+          } else {
+            batch.set(ipBanRef, {
+              ipHash: deviceData.ipHash,
+              ipAddress: deviceData.ipAddress || null,
+              userId: userId,
+              username: username?.substring(0, 30) || 'Unknown',
+              bannedBy: state.currentUserId,
+              timestamp: serverTimestamp(),
+              reason: "Admin Action",
+            });
+          }
+        }
+        
+        // Also ban raw IP if available
+        if (deviceData.ipAddress) {
+          const rawIpKey = deviceData.ipAddress.replace(/\./g, '_');
+          const rawIpBanRef = doc(state.db, "banned_ips", rawIpKey);
+          if (isBanned) {
+            batch.delete(rawIpBanRef);
+          } else {
+            batch.set(rawIpBanRef, {
+              ipAddress: deviceData.ipAddress,
+              userId: userId,
+              username: username?.substring(0, 30) || 'Unknown',
+              bannedBy: state.currentUserId,
+              timestamp: serverTimestamp(),
+              reason: "Admin Action",
+            });
+          }
+        }
+      }
+      
       await batch.commit();
-      showToast(`User has been ${isBanned ? "UNBANNED" : "BANNED"}.`, "info");
+      
+      const devicesCount = devicesSnapshot.docs.length;
+      showToast(
+        `User has been ${isBanned ? "UNBANNED" : "BANNED"}. ${devicesCount} device(s) affected.`, 
+        "info"
+      );
       
     } catch (e) {
       console.error('Ban error:', e);
@@ -943,11 +1262,12 @@ async function toggleBanUser() {
 // FIREBASE INITIALIZATION
 // ============================================================
 
-/**
- * Initialize Firebase and authentication
- */
 async function initFirebase() {
   try {
+    // First, initialize device identification
+    console.log('Initializing device identification...');
+    state.deviceInfo = await initializeDeviceIdentification();
+    
     state.app = initializeApp(firebaseConfig);
 
     try {
@@ -959,7 +1279,6 @@ async function initFirebase() {
       console.warn('App Check initialization failed:', appCheckError);
     }
 
-    // Use modern persistence API
     try {
       state.db = initializeFirestore(state.app, {
         localCache: persistentLocalCache({
@@ -967,9 +1286,19 @@ async function initFirebase() {
         })
       });
     } catch (persistenceError) {
-      // Fallback if persistence fails
       console.warn('Persistence initialization failed, using default:', persistenceError);
       state.db = initializeFirestore(state.app, {});
+    }
+
+    // Check for device-level ban BEFORE authentication
+    console.log('Checking device ban status...');
+    const deviceBanCheck = await checkDeviceBan(state.db, state.deviceInfo);
+    
+    if (deviceBanCheck.isBanned) {
+      console.log('Device is banned:', deviceBanCheck.reason);
+      state.isDeviceBanned = true;
+      showDeviceBannedScreen(deviceBanCheck.reason);
+      return;
     }
 
     state.auth = getAuth(state.app);
@@ -978,18 +1307,18 @@ async function initFirebase() {
   } catch (error) {
     console.error("Error initializing Firebase:", error);
     setTextSafely(loading, "Error: Could not initialize. Please refresh.");
+    hideBanCheckOverlay();
     throw error;
   }
 }
 
-/**
- * Handle authentication state changes
- * @param {Object|null} user - Firebase user object
- */
 async function handleAuthStateChange(user) {
   if (user) {
     state.currentUserId = user.uid;
     console.log("Authenticated with UID:", state.currentUserId);
+
+    // Register device with user association
+    await registerDevice(state.db, state.currentUserId, state.deviceInfo);
 
     state.confessionsCollection = collection(state.db, "confessions");
     state.chatCollection = collection(state.db, "chat");
@@ -1002,6 +1331,7 @@ async function handleAuthStateChange(user) {
 
     listenForUserProfiles();
     listenForBanStatus();
+    listenForDeviceBans();
 
     try {
       await checkAdminStatus();
@@ -1015,6 +1345,9 @@ async function handleAuthStateChange(user) {
       console.error("Profile load failed:", e);
     }
 
+    // Hide the loading overlay
+    hideBanCheckOverlay();
+
     initScrollObserver();
     showPage(state.currentPage);
     state.isInitialized = true;
@@ -1025,13 +1358,11 @@ async function handleAuthStateChange(user) {
     } catch (e) {
       console.error("Anonymous auth failed:", e);
       setTextSafely(loading, "Error: Could not sign in. Please refresh.");
+      hideBanCheckOverlay();
     }
   }
 }
 
-/**
- * Check if current user is an admin
- */
 async function checkAdminStatus() {
   if (!state.currentUserId || !state.db) return;
   
@@ -1053,9 +1384,6 @@ async function checkAdminStatus() {
 // PINNED MESSAGES
 // ============================================================
 
-/**
- * Listen for pinned messages in current collection
- */
 function listenForPinnedMessages() {
   if (typeof unsubscribers.pinned === 'function') {
     unsubscribers.pinned();
@@ -1105,9 +1433,6 @@ function listenForPinnedMessages() {
 // BAN STATUS
 // ============================================================
 
-/**
- * Listen for ban status changes
- */
 function listenForBanStatus() {
   if (typeof unsubscribers.banCheck === 'function') {
     unsubscribers.banCheck();
@@ -1134,8 +1459,49 @@ function listenForBanStatus() {
 }
 
 /**
- * Show banned user screen
+ * Listen for device-level bans (fingerprint & IP)
  */
+function listenForDeviceBans() {
+  if (typeof unsubscribers.deviceBanCheck === 'function') {
+    unsubscribers.deviceBanCheck();
+    unsubscribers.deviceBanCheck = () => {};
+  }
+  
+  if (!state.db || !state.deviceInfo?.fingerprint) return;
+
+  // Listen for fingerprint ban
+  unsubscribers.deviceBanCheck = onSnapshot(
+    doc(state.db, "banned_devices", state.deviceInfo.fingerprint), 
+    (docSnap) => {
+      if (docSnap.exists()) {
+        state.isDeviceBanned = true;
+        cleanupAllListeners();
+        showDeviceBannedScreen('Device fingerprint banned');
+      }
+    },
+    (error) => {
+      console.warn("Device ban check error:", error);
+    }
+  );
+  
+  // Also listen for IP ban if we have an IP
+  if (state.deviceInfo.ipHash) {
+    onSnapshot(
+      doc(state.db, "banned_ips", state.deviceInfo.ipHash), 
+      (docSnap) => {
+        if (docSnap.exists()) {
+          state.isDeviceBanned = true;
+          cleanupAllListeners();
+          showDeviceBannedScreen('IP address banned');
+        }
+      },
+      (error) => {
+        console.warn("IP ban check error:", error);
+      }
+    );
+  }
+}
+
 function showBannedScreen() {
   document.body.innerHTML = '';
   document.body.className = 'banned-overlay';
@@ -1155,9 +1521,6 @@ function showBannedScreen() {
 // SCROLL OBSERVER
 // ============================================================
 
-/**
- * Initialize intersection observer for scroll tracking
- */
 function initScrollObserver() {
   const options = { 
     root: feedContainer, 
@@ -1172,15 +1535,9 @@ function initScrollObserver() {
     });
   }, options);
 
-  // Add passive scroll listener for smoother scrolling
-  feedContainer?.addEventListener('scroll', () => {
-    // Additional scroll-based logic if needed
-  }, { passive: true });
+  feedContainer?.addEventListener('scroll', () => {}, { passive: true });
 }
 
-/**
- * Update scroll to bottom button visibility
- */
 function updateScrollButton() {
   if (!scrollToBottomBtn || !newMsgCount) return;
   
@@ -1204,9 +1561,6 @@ function updateScrollButton() {
   }
 }
 
-/**
- * Scroll to bottom of feed
- */
 function scrollToBottom() {
   if (!feedContainer) return;
   
@@ -1217,26 +1571,16 @@ function scrollToBottom() {
 }
 
 // ============================================================
-// USER PROFILES (UPDATED - On-Demand Loading)
+// USER PROFILES
 // ============================================================
 
-/**
- * Request a user profile to be loaded (batched for efficiency)
- * @param {string} userId - User ID to load
- */
 function requestUserProfile(userId) {
   if (!userId || typeof userId !== 'string') return;
-  
-  // Skip if already loaded
   if (state.userProfiles[userId]) return;
-  
-  // Skip if already pending
   if (state.pendingProfileLoads.has(userId)) return;
   
-  // Add to pending queue
   state.pendingProfileLoads.add(userId);
   
-  // Debounce the actual loading (wait 100ms to batch requests)
   if (state.profileLoadTimeout) {
     clearTimeout(state.profileLoadTimeout);
   }
@@ -1246,19 +1590,13 @@ function requestUserProfile(userId) {
   }, 100);
 }
 
-/**
- * Load all pending user profiles in a batch
- */
 async function loadPendingProfiles() {
   if (state.pendingProfileLoads.size === 0) return;
   if (!state.db) return;
   
-  // Get the pending user IDs and clear the queue
   const userIds = Array.from(state.pendingProfileLoads);
   state.pendingProfileLoads.clear();
   
-  // Firestore "in" queries are limited to 30 items
-  // So we need to batch them
   const batchSize = 30;
   
   for (let i = 0; i < userIds.length; i += batchSize) {
@@ -1279,7 +1617,6 @@ async function loadPendingProfiles() {
     } catch (error) {
       console.error("Error loading user profiles:", error);
       
-      // On error, try loading individually
       for (const userId of batch) {
         try {
           const docRef = doc(state.db, "users", userId);
@@ -1294,15 +1631,10 @@ async function loadPendingProfiles() {
     }
   }
   
-  // After loading, re-render to show the names
   updateDisplayedUsernames();
 }
 
-/**
- * Update displayed usernames after profiles are loaded
- */
 function updateDisplayedUsernames() {
-  // Find all message bubbles and update their displayed usernames
   document.querySelectorAll('.message-bubble').forEach((bubble) => {
     const userId = bubble.dataset.userId;
     if (!userId) return;
@@ -1312,13 +1644,11 @@ function updateDisplayedUsernames() {
     
     const username = profile.username || "Anonymous";
     
-    // Find the username element within this bubble
     const usernameEl = bubble.querySelector('.font-bold.text-sm.opacity-90');
     if (usernameEl && usernameEl.textContent !== username) {
       usernameEl.textContent = username;
     }
     
-    // Also update the profile photo if needed
     const imgEl = bubble.querySelector('.chat-pfp');
     if (imgEl && profile.profilePhotoURL) {
       const currentSrc = imgEl.getAttribute('src');
@@ -1329,28 +1659,20 @@ function updateDisplayedUsernames() {
   });
 }
 
-/**
- * Listen for user profile changes (only for profiles we've already loaded)
- * This keeps cached profiles up-to-date without loading all users
- */
 function listenForUserProfiles() {
   if (typeof unsubscribers.userProfiles === 'function') {
     unsubscribers.userProfiles();
     unsubscribers.userProfiles = () => {};
   }
 
-  // Only set up listener if we have some profiles loaded
-  // This listener will update profiles we already have
   const checkAndSetupListener = () => {
     const loadedUserIds = Object.keys(state.userProfiles);
     
     if (loadedUserIds.length === 0) {
-      // No profiles loaded yet, check again later
       setTimeout(checkAndSetupListener, 2000);
       return;
     }
     
-    // Limit to first 30 users (Firestore "in" query limit)
     const userIdsToWatch = loadedUserIds.slice(0, 30);
     
     try {
@@ -1367,7 +1689,6 @@ function listenForUserProfiles() {
             }
           });
           
-          // Update displayed usernames when profiles change
           updateDisplayedUsernames();
         },
         (error) => {
@@ -1379,13 +1700,9 @@ function listenForUserProfiles() {
     }
   };
   
-  // Start checking after a short delay
   setTimeout(checkAndSetupListener, 1000);
 }
 
-/**
- * Load current user's profile
- */
 async function loadUserProfile() {
   if (!state.db || !state.currentUserId) return;
   
@@ -1395,7 +1712,6 @@ async function loadUserProfile() {
     if (userDoc.exists()) {
       const data = userDoc.data();
       
-      // Cache the profile
       state.userProfiles[state.currentUserId] = data;
       
       if (data.banned) {
@@ -1425,9 +1741,6 @@ async function loadUserProfile() {
   }
 }
 
-/**
- * Handle profile save
- */
 async function handleProfileSave() {
   if (!state.db || !state.currentUserId) return;
   
@@ -1440,7 +1753,6 @@ async function handleProfileSave() {
     return;
   }
   
-  // Disable all modal buttons during save
   modalSaveButton.textContent = "CHECKING...";
   modalSaveButton.disabled = true;
   modalCloseButton.disabled = true;
@@ -1479,7 +1791,6 @@ async function handleProfileSave() {
     state.currentUsername = inputVal;
     state.currentProfilePhotoURL = newProfilePhotoURL;
     
-    // Update cached profile
     state.userProfiles[state.currentUserId] = {
       ...state.userProfiles[state.currentUserId],
       username: inputVal,
@@ -1504,9 +1815,6 @@ async function handleProfileSave() {
 // MODAL FUNCTIONS
 // ============================================================
 
-/**
- * Open profile modal
- */
 function openProfileModal() {
   if (!modalUsernameInput || !profileModal) return;
   
@@ -1520,9 +1828,6 @@ function openProfileModal() {
   setTimeout(() => modalUsernameInput.focus(), 100);
 }
 
-/**
- * Close profile modal
- */
 function closeProfileModal() {
   if (!profileModal) return;
   
@@ -1530,12 +1835,6 @@ function closeProfileModal() {
   profileModal.setAttribute("aria-hidden", "true");
 }
 
-/**
- * Show edit message modal
- * @param {string} docId - Document ID
- * @param {string} collectionName - Collection name
- * @param {string} currentText - Current message text
- */
 function showEditModal(docId, collectionName, currentText) {
   if (!editModal || !modalEditTextArea) return;
   
@@ -1555,9 +1854,6 @@ function showEditModal(docId, collectionName, currentText) {
   }, 100);
 }
 
-/**
- * Close edit modal
- */
 function closeEditModal() {
   if (!editModal) return;
   
@@ -1567,9 +1863,6 @@ function closeEditModal() {
   state.collectionToEdit = null;
 }
 
-/**
- * Save edited message
- */
 async function saveEdit() {
   const newText = modalEditTextArea.value.trim();
   
@@ -1603,12 +1896,6 @@ async function saveEdit() {
   }
 }
 
-/**
- * Show confirmation modal
- * @param {string} text - Confirmation text
- * @param {boolean} isMine - Whether message belongs to current user
- * @param {string} docId - Document ID
- */
 function showConfirmModal(text, isMine, docId) {
   if (!confirmModal || !confirmModalActionContainer) return;
   
@@ -1648,7 +1935,6 @@ function showConfirmModal(text, isMine, docId) {
     };
     
     confirmModalActionContainer.appendChild(btnForMe);
-    confirmModalActionContainer.appendChild(btnEveryone);
   } else {
     const btnForMe = document.createElement('button');
     btnForMe.type = 'button';
@@ -1672,9 +1958,6 @@ function showConfirmModal(text, isMine, docId) {
   confirmModal.setAttribute("aria-hidden", "false");
 }
 
-/**
- * Close confirmation modal
- */
 function closeConfirmModal() {
   if (!confirmModal) return;
   
@@ -1686,13 +1969,6 @@ function closeConfirmModal() {
 // REACTIONS
 // ============================================================
 
-/**
- * Toggle reaction on a message
- * @param {string} docId - Document ID
- * @param {string} collectionName - Collection name
- * @param {string} reactionType - Type of reaction
- * @param {boolean} hasReacted - Whether user already reacted
- */
 async function toggleReaction(docId, collectionName, reactionType, hasReacted) {
   if (!state.db || !state.currentUserId) return;
   
@@ -1722,11 +1998,6 @@ async function toggleReaction(docId, collectionName, reactionType, hasReacted) {
 // CONTEXT MENU
 // ============================================================
 
-/**
- * Show dropdown context menu
- * @param {Event} event - Click event
- * @param {Object} data - Message data
- */
 function showDropdownMenu(event, data) {
   event.stopPropagation();
   
@@ -1788,9 +2059,6 @@ function showDropdownMenu(event, data) {
   contextMenu.classList.add("is-open");
 }
 
-/**
- * Hide dropdown menu
- */
 function hideDropdownMenu() {
   if (contextMenu) {
     contextMenu.classList.remove("is-open");
@@ -1801,10 +2069,6 @@ function hideDropdownMenu() {
 // SELECTION MODE
 // ============================================================
 
-/**
- * Handle message click in selection mode
- * @param {HTMLElement} bubble - Message bubble element
- */
 function handleMessageClick(bubble) {
   if (!state.isSelectionMode) return;
   
@@ -1821,9 +2085,6 @@ function handleMessageClick(bubble) {
   updateSelectionBar();
 }
 
-/**
- * Enter selection mode
- */
 function enterSelectionMode() {
   state.isSelectionMode = true;
   document.body.classList.add("selection-mode");
@@ -1850,9 +2111,6 @@ function enterSelectionMode() {
   updateSelectionBar();
 }
 
-/**
- * Exit selection mode
- */
 function exitSelectionMode() {
   state.isSelectionMode = false;
   document.body.classList.remove("selection-mode");
@@ -1880,9 +2138,6 @@ function exitSelectionMode() {
   });
 }
 
-/**
- * Update selection bar count
- */
 function updateSelectionBar() {
   const count = state.selectedMessages.size;
   setTextSafely(selectionCount, `${count} selected`);
@@ -1892,9 +2147,6 @@ function updateSelectionBar() {
   }
 }
 
-/**
- * Handle multi-message delete
- */
 async function handleMultiDelete() {
   const count = state.selectedMessages.size;
   if (count === 0) return;
@@ -1979,10 +2231,6 @@ async function handleMultiDelete() {
 // PAGE NAVIGATION
 // ============================================================
 
-/**
- * Show specified page (chat or confessions)
- * @param {string} page - Page name
- */
 function showPage(page) {
   if (page !== 'chat' && page !== 'confessions') {
     page = 'chat';
@@ -1993,10 +2241,8 @@ function showPage(page) {
   if (state.isSelectionMode) exitSelectionMode();
   cancelReplyMode();
   
-  // Clean up reaction pickers on page change
   document.querySelectorAll(".reaction-picker").forEach(p => p.remove());
   
-  // Properly clean up listeners
   if (typeof unsubscribers.confessions === 'function') {
     unsubscribers.confessions();
     unsubscribers.confessions = () => {};
@@ -2063,14 +2309,6 @@ function showPage(page) {
 // REAL-TIME LISTENERS
 // ============================================================
 
-/**
- * Safe wrapper for renderFeed with error handling
- * @param {Array} docs - Firestore documents
- * @param {string} type - Collection type
- * @param {Object} snapshot - Firestore snapshot
- * @param {boolean} isRerender - Whether this is a re-render
- * @param {boolean} isFirstSnapshot - Whether this is the first snapshot
- */
 function safeRenderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
   try {
     renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot);
@@ -2095,10 +2333,6 @@ function safeRenderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = fals
   }
 }
 
-/**
- * Listen for confessions
- * @param {boolean} isRerender - Whether this is a re-render
- */
 function listenForConfessions(isRerender = false) {
   if (isRerender) {
     safeRenderFeed(state.lastConfessionDocs, "confessions", null, true);
@@ -2141,10 +2375,6 @@ function listenForConfessions(isRerender = false) {
   );
 }
 
-/**
- * Listen for chat messages
- * @param {boolean} isRerender - Whether this is a re-render
- */
 function listenForChat(isRerender = false) {
   if (isRerender) {
     safeRenderFeed(state.lastChatDocs, "chat", null, true);
@@ -2187,9 +2417,6 @@ function listenForChat(isRerender = false) {
   );
 }
 
-/**
- * Listen for typing status with improved stale detection
- */
 function listenForTyping() {
   if (typeof unsubscribers.typingStatus === 'function') {
     unsubscribers.typingStatus();
@@ -2204,12 +2431,10 @@ function listenForTyping() {
       
       snapshot.docs.forEach((docSnap) => {
         const data = docSnap.data();
-        const userId = docSnap.id;
+        const oduserId = docSnap.id;
         
-        // Skip self
         if (userId === state.currentUserId) return;
         
-        // Check if still typing and not stale
         if (data.isTyping && data.timestamp) {
           const timeSinceTyping = now - data.timestamp;
           
@@ -2241,10 +2466,6 @@ function listenForTyping() {
   );
 }
 
-/**
- * Update typing status
- * @param {boolean} isTyping - Whether user is typing
- */
 const updateTypingStatus = debounce(async (isTyping) => {
   if (!state.db || !state.currentUserId) return;
   
@@ -2274,21 +2495,11 @@ const updateTypingStatus = debounce(async (isTyping) => {
 // RENDER FEED
 // ============================================================
 
-/**
- * Render message feed
- * @param {Array} docs - Firestore documents
- * @param {string} type - Collection type
- * @param {Object} snapshot - Firestore snapshot
- * @param {boolean} isRerender - Whether this is a re-render
- * @param {boolean} isFirstSnapshot - Whether this is the first snapshot
- */
 function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
   if (!feedContainer) return;
   
-  // Clean up any floating reaction pickers
   document.querySelectorAll(".reaction-picker").forEach(p => p.remove());
   
-  // Handle notifications for new messages
   if (!isRerender && snapshot) {
     snapshot.docChanges().forEach((change) => {
       if (change.type === "added") {
@@ -2330,7 +2541,6 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
   docs.forEach((docInstance) => {
     const data = docInstance.data();
     
-    // Skip hidden messages
     if (data.hiddenFor?.includes(state.currentUserId)) {
       return;
     }
@@ -2339,18 +2549,15 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
     const messageDateObj = data.timestamp ? data.timestamp.toDate() : new Date();
     const messageDateStr = messageDateObj.toDateString();
 
-    // Request user profile if not loaded (NEW - on-demand loading)
     const docUserId = data.userId;
     if (docUserId && !state.userProfiles[docUserId]) {
       requestUserProfile(docUserId);
     }
     
-    // Also request profile for reply author if exists
     if (data.replyTo?.userId && !state.userProfiles[data.replyTo.userId]) {
       requestUserProfile(data.replyTo.userId);
     }
 
-    // Date separator
     if (lastDateString !== messageDateStr) {
       const sepDiv = document.createElement('div');
       sepDiv.className = 'date-separator';
@@ -2374,25 +2581,19 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
     
     const userColor = getUserColor(docUserId);
 
-    // Create message structure
     const alignWrapper = document.createElement("div");
     alignWrapper.className = `flex w-full ${isMine ? "justify-end" : "justify-start"}`;
     
     const row = document.createElement("div");
     row.className = "message-wrapper";
 
-    // Create bubble
     const bubble = document.createElement("div");
-    // NOTE: Top spacing is applied to the wrapper so the kebab button (positioned relative to wrapper)
-    // aligns with the bubble's top edge on mobile.
     bubble.className = `message-bubble rounded-lg max-w-xs sm:max-w-md md:max-w-lg ${isMine ? "my-message" : ""}`;
     
-    // Pinned styling
     if (data.isPinned) {
       bubble.classList.add("pinned");
     }
     
-    // Dataset attributes
     bubble.dataset.id = docInstance.id;
     bubble.dataset.text = text;
     bubble.dataset.isMine = String(isMine);
@@ -2401,18 +2602,15 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
     bubble.dataset.isPinned = String(data.isPinned || false);
     bubble.dataset.timestamp = data.timestamp ? String(data.timestamp.toMillis()) : String(Date.now());
     
-    // Styling for other users
     if (!isMine) {
       bubble.style.borderLeft = `3px solid ${userColor}`;
       bubble.style.background = `linear-gradient(90deg, ${userColor}10, transparent)`;
     }
     
-    // Selection mode styling
     if (state.isSelectionMode && state.selectedMessages.has(docInstance.id)) {
       bubble.classList.add("selected-message");
     }
     
-    // Click handler for selection
     bubble.addEventListener('click', (e) => {
       if (state.isSelectionMode) {
         e.preventDefault();
@@ -2421,7 +2619,6 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
       }
     });
 
-    // Kebab menu button - positioned outside bubble at top corner
     const kebabBtn = document.createElement("button");
     kebabBtn.type = "button";
     kebabBtn.className = "kebab-btn";
@@ -2432,7 +2629,6 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
       showDropdownMenu(e, bubble.dataset);
     });
 
-    // Header with avatar and username (if not consecutive)
     if (!isConsecutive) {
       const headerElement = document.createElement("div");
       headerElement.className = `flex items-center gap-1.5 mb-1 ${isMine ? "justify-end" : "justify-start"}`;
@@ -2459,7 +2655,6 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
       bubble.appendChild(headerElement);
     }
 
-    // Reply preview
     if (data.replyTo) {
       const replyPreview = document.createElement("div");
       replyPreview.className = "reply-preview";
@@ -2496,7 +2691,6 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
       bubble.appendChild(replyPreview);
     }
 
-    // Message text
     const textElement = document.createElement("p");
     textElement.className = "text-left";
     
@@ -2511,7 +2705,6 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
     textElement.appendChild(document.createTextNode(text));
     bubble.appendChild(textElement);
 
-    // Footer with timestamp
     const footerDiv = document.createElement("div");
     footerDiv.className = "bubble-footer";
     footerDiv.style.justifyContent = isMine ? "flex-end" : "flex-start";
@@ -2527,7 +2720,6 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
     footerDiv.appendChild(timeElement);
     bubble.appendChild(footerDiv);
 
-    // Reaction chips
     const docReactions = data.reactions || {};
     const chipsContainer = document.createElement("div");
     chipsContainer.className = "reaction-chips-container";
@@ -2566,7 +2758,6 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
       bubble.classList.add("has-reactions");
     }
 
-    // Action buttons (bottom) - Reply
     const replyBtn = document.createElement("button");
     replyBtn.type = "button";
     replyBtn.className = "side-action-btn";
@@ -2577,14 +2768,12 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
       startReplyMode(bubble.dataset);
     };
 
-    // Action buttons (bottom) - React
     const reactBtn = document.createElement("button");
     reactBtn.type = "button";
     reactBtn.className = "side-action-btn";
     reactBtn.setAttribute("aria-label", "Add reaction");
     reactBtn.textContent = "♡";
 
-    // Reaction picker
     const picker = document.createElement("div");
     picker.className = "reaction-picker hidden";
     picker.setAttribute("role", "menu");
@@ -2626,13 +2815,11 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
       document.body.appendChild(picker);
     };
 
-    // Bubble wrapper for positioning kebab outside
     const bubbleWrapper = document.createElement("div");
     bubbleWrapper.className = `bubble-wrapper ${isMine ? "my-bubble-wrapper" : ""} ${isConsecutive ? "mt-0.5" : "mt-2"}`;
     bubbleWrapper.appendChild(kebabBtn);
     bubbleWrapper.appendChild(bubble);
 
-    // Assemble row based on message ownership
     if (isMine) {
       row.appendChild(reactBtn);
       row.appendChild(replyBtn);
@@ -2647,7 +2834,6 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
     feedContainer.appendChild(alignWrapper);
   });
   
-  // Scroll anchor for observer
   const scrollAnchor = document.createElement("div");
   scrollAnchor.id = "scrollAnchor";
   scrollAnchor.style.height = "1px";
@@ -2659,7 +2845,6 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
     state.bottomObserver.observe(scrollAnchor);
   }
 
-  // Handle scrolling
   const hasNewMessages = snapshot && 
     snapshot.docChanges().some(change => change.type === 'added');
   
@@ -2689,15 +2874,16 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
 // MESSAGE POSTING
 // ============================================================
 
-/**
- * Post a message
- * @param {Object} collectionRef - Firestore collection reference
- * @param {HTMLTextAreaElement} input - Input element
- */
 async function postMessage(collectionRef, input) {
   if (state.currentUsername === "Anonymous") {
     showToast("Please set a username first!", "error");
     openProfileModal();
+    return;
+  }
+  
+  // Check device ban before posting
+  if (state.isDeviceBanned) {
+    showToast("Your device has been banned.", "error");
     return;
   }
   
@@ -2715,7 +2901,6 @@ async function postMessage(collectionRef, input) {
     }
   }
   
-  // Validate message with enhanced validation
   const validation = validateMessageBeforePost(input.value);
   if (!validation.valid) {
     showToast(validation.error, "error");
@@ -2726,7 +2911,6 @@ async function postMessage(collectionRef, input) {
   
   if (!state.db) return;
   
-  // Client-side rate limit check
   const now = Date.now();
   if (now - rateLimitState.lastMessageTime < RATE_LIMIT_MS) {
     const remainingTime = Math.ceil((RATE_LIMIT_MS - (now - rateLimitState.lastMessageTime)) / 1000);
@@ -2736,7 +2920,6 @@ async function postMessage(collectionRef, input) {
   
   input.disabled = true;
   
-  // Add visual loading state
   const submitBtn = collectionRef === state.chatCollection ? 
     document.getElementById('chatButton') : 
     document.getElementById('confessionButton');
@@ -2776,7 +2959,6 @@ async function postMessage(collectionRef, input) {
     updateTypingStatus(false);
     scrollToBottom();
     
-    // Reset character counter (NEW)
     const counter = input === chatInput ? chatCharCount : confessionCharCount;
     updateCharacterCounter(input, counter);
     
@@ -2805,10 +2987,6 @@ async function postMessage(collectionRef, input) {
 // REPLY MODE
 // ============================================================
 
-/**
- * Start reply mode
- * @param {Object} messageData - Message data object
- */
 function startReplyMode(messageData) {
   const repliedUserId = messageData.userId || 
     (messageData.isMine === "true" ? state.currentUserId : null);
@@ -2831,9 +3009,6 @@ function startReplyMode(messageData) {
   if (input) input.focus();
 }
 
-/**
- * Cancel reply mode
- */
 function cancelReplyMode() {
   state.replyToMessage = null;
   
@@ -2846,7 +3021,6 @@ function cancelReplyMode() {
 // EVENT LISTENERS
 // ============================================================
 
-// Global click handler for closing menus
 document.addEventListener("click", (e) => {
   if (!e.target.closest(".side-action-btn") && !e.target.closest(".reaction-picker")) {
     document.querySelectorAll(".reaction-picker").forEach(p => {
@@ -2860,7 +3034,6 @@ document.addEventListener("click", (e) => {
   }
 });
 
-// Update timestamps periodically
 setInterval(() => {
   document.querySelectorAll('.inner-timestamp').forEach(el => {
     const ts = parseInt(el.dataset.ts, 10);
@@ -2871,10 +3044,8 @@ setInterval(() => {
   });
 }, 60000);
 
-// Scroll button
 scrollToBottomBtn?.addEventListener("click", scrollToBottom);
 
-// Form submissions
 confessionForm?.addEventListener("submit", (e) => {
   e.preventDefault();
   postMessage(state.confessionsCollection, confessionInput);
@@ -2885,7 +3056,6 @@ chatForm?.addEventListener("submit", (e) => {
   postMessage(state.chatCollection, chatInput);
 });
 
-// Navigation
 navConfessions?.addEventListener("click", () => showPage("confessions"));
 navChat?.addEventListener("click", () => showPage("chat"));
 
@@ -2903,7 +3073,6 @@ navChat?.addEventListener("keydown", (e) => {
   }
 });
 
-// Modal buttons
 profileButton?.addEventListener("click", openProfileModal);
 modalCloseButton?.addEventListener("click", closeProfileModal);
 modalSaveButton?.addEventListener("click", handleProfileSave);
@@ -2911,7 +3080,6 @@ editModalCancelButton?.addEventListener("click", closeEditModal);
 editModalSaveButton?.addEventListener("click", saveEdit);
 confirmModalNoButton?.addEventListener("click", closeConfirmModal);
 
-// Context menu actions
 menuEdit?.addEventListener("click", () => {
   if (state.currentContextMenuData) {
     showEditModal(
@@ -2940,12 +3108,10 @@ menuSelect?.addEventListener("click", () => {
   hideDropdownMenu();
 });
 
-// Selection bar
 selectionCancel?.addEventListener("click", exitSelectionMode);
 selectionDelete?.addEventListener("click", handleMultiDelete);
 cancelReply?.addEventListener("click", cancelReplyMode);
 
-// Input handlers with character counter (UPDATED)
 confessionInput?.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -2964,7 +3130,6 @@ chatInput?.addEventListener("keydown", (e) => {
   }
 });
 
-// Input event listeners with character counter (UPDATED)
 chatInput?.addEventListener("input", () => {
   updateTypingStatus(true);
   updateCharacterCounter(chatInput, chatCharCount);
@@ -2975,7 +3140,6 @@ confessionInput?.addEventListener("input", () => {
   updateCharacterCounter(confessionInput, confessionCharCount);
 });
 
-// Escape key handler
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (profileModal?.classList.contains("is-open")) {
@@ -2994,7 +3158,6 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-// Handle visibility change
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
     if (state.userIsAtBottom) {
@@ -3004,14 +3167,12 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-// Handle beforeunload
 window.addEventListener("beforeunload", () => {
   if (state.db && state.currentUserId) {
     updateTypingStatus(false);
   }
 });
 
-// Handle page unload - cleanup listeners
 window.addEventListener('unload', () => {
   cleanupAllListeners();
 });
@@ -3023,4 +3184,5 @@ window.addEventListener('unload', () => {
 initFirebase().catch(err => {
   console.error("Failed to initialize app:", err);
   setTextSafely(loading, "Error: Failed to initialize. Please refresh the page.");
+  hideBanCheckOverlay();
 });

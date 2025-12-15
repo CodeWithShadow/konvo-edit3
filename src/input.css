@@ -1276,3 +1276,54 @@ body.selection-mode .message-bubble {
   font-weight: 700;
   animation: systemPulse 0.5s ease-in-out infinite;
 }
+
+/* ============================
+   33. BAN CHECK OVERLAY
+   ============================ */
+
+.ban-check-overlay {
+  position: fixed;
+  inset: 0;
+  background-color: var(--bg-color);
+  z-index: 99999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ban-check-overlay.hidden {
+  display: none;
+  opacity: 0;
+}
+
+.ban-check-text {
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  animation: systemPulse 2s ease-in-out infinite;
+}
+
+/* Device banned state */
+.device-banned .ban-check-overlay {
+  display: flex !important;
+}
+
+.device-banned-content {
+  text-align: center;
+}
+
+.device-banned-content h1 {
+  font-size: 1.875rem;
+  color: var(--danger);
+  margin-bottom: 1rem;
+}
+
+.device-banned-content p {
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  margin-bottom: 0.5rem;
+}
+
+.device-banned-content .reason {
+  color: #666;
+  font-size: 0.75rem;
+}
