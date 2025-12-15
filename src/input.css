@@ -339,6 +339,7 @@ a:focus-visible {
 #feedContainer {
   background-color: transparent;
   overflow-y: auto;
+  overflow-x: hidden; /* prevent sideways scroll when a row overflows */
   scroll-behavior: smooth;
   padding-bottom: 20px;
   overflow-anchor: none;
@@ -354,7 +355,7 @@ a:focus-visible {
   border: 1px solid var(--border-color);
   word-wrap: break-word;
   white-space: pre-wrap;
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere; /* stronger than break-word for long unbroken strings */
   word-break: break-word;
   hyphens: auto;
   padding: 0.75rem 1rem;
@@ -449,6 +450,7 @@ body.selection-mode .message-bubble {
   flex-direction: column;
   align-items: flex-start;
   max-width: 100%;
+  min-width: 0; /* allow bubble to shrink instead of forcing horizontal overflow */
 }
 
 .bubble-wrapper.my-bubble-wrapper {
@@ -537,6 +539,11 @@ body.selection-mode .message-bubble {
     right: auto;
     left: -28px;
   }
+
+  /* On mobile, account for always-visible side action buttons to avoid horizontal scrolling */
+  .message-bubble {
+    max-width: calc(100vw - 140px);
+  }
 }
 
 /* Extra small screens - tighter position */
@@ -608,6 +615,8 @@ body.selection-mode .message-bubble {
   display: flex;
   align-items: flex-end;
   gap: 8px;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .side-action-btn {
