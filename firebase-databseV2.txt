@@ -4,12 +4,7 @@ service cloud.firestore {
 
     // ============================================================
     // KONVO - ANONYMOUS CHAT PLATFORM SECURITY RULES
-    // Version: 3.1 (Device Fingerprinting + IP Ban + Auto-Ban System)
-    // ============================================================
-    // New Collections Added:
-    // - banned_devices: Stores banned device fingerprints
-    // - banned_ips: Stores banned IP addresses (hashed)
-    // - user_devices: Links users to their devices/IPs
+    // Version: 3.3 (Fixed Self-Ban Validation)
     // ============================================================
 
     // ============================
@@ -56,13 +51,8 @@ service cloud.firestore {
     }
 
     function canSendMessage() {
-      let userDoc = /databases/$(database)/documents/users/$(request.auth.uid);
-      return isActiveUser() && (
-        !exists(userDoc) ||
-        !('lastMessageAt' in get(userDoc).data) ||
-        get(userDoc).data.lastMessageAt + duration.value(2, 's') < request.time
-      );
-    }
+  return isActiveUser();
+}
 
     function isValidUsername(username) {
       return username is string
@@ -230,7 +220,6 @@ service cloud.firestore {
              && data.timestamp == request.time;
     }
 
-    // UPDATED: Allow SYSTEM_AUTO_BAN
     function isValidBanRecord() {
       let data = request.resource.data;
       let requiredFields = ['bannedBy', 'timestamp'];
@@ -248,7 +237,6 @@ service cloud.firestore {
     // 3. DEVICE BAN VALIDATION
     // ============================
 
-    // UPDATED: Allow SYSTEM_AUTO_BAN
     function isValidDeviceBanRecord() {
       let data = request.resource.data;
       let requiredFields = ['fingerprint', 'bannedBy', 'timestamp'];
@@ -268,7 +256,6 @@ service cloud.firestore {
              && (!('platform' in data) || data.platform == null || (data.platform is string && data.platform.size() <= 100));
     }
 
-    // UPDATED: Allow SYSTEM_AUTO_BAN
     function isValidIPBanRecord() {
       let data = request.resource.data;
       let requiredFields = ['bannedBy', 'timestamp'];
@@ -283,6 +270,46 @@ service cloud.firestore {
              && (!('userId' in data) || (data.userId is string && data.userId.size() <= 128))
              && (!('username' in data) || (data.username is string && data.username.size() <= 30))
              && (!('reason' in data) || (data.reason is string && data.reason.size() <= 500));
+    }
+
+    // ============================
+    // FIXED: Self-ban validation (for spam auto-ban)
+    // ============================
+
+    // FIXED: Removed userId requirement - document ID already identifies the user
+    function isValidSelfBanRecord() {
+      let data = request.resource.data;
+      let allowedFields = ['bannedBy', 'timestamp', 'reason', 'username'];
+      
+      return data.keys().hasOnly(allowedFields)
+             && data.bannedBy == "SYSTEM_AUTO_BAN"
+             && data.timestamp == request.time
+             && 'reason' in data
+             && data.reason is string
+             && data.reason.matches('.*[Ss]pam.*');
+      // Note: User identity verified in match rule via request.auth.uid == userId
+    }
+
+    function isValidSelfDeviceBanRecord() {
+      let data = request.resource.data;
+      return data.bannedBy == "SYSTEM_AUTO_BAN"
+             && data.timestamp == request.time
+             && 'reason' in data
+             && data.reason is string
+             && data.reason.matches('.*[Ss]pam.*')
+             && data.userId == request.auth.uid
+             && data.fingerprint is string
+             && data.fingerprint.size() > 0;
+    }
+
+    function isValidSelfIPBanRecord() {
+      let data = request.resource.data;
+      return data.bannedBy == "SYSTEM_AUTO_BAN"
+             && data.timestamp == request.time
+             && 'reason' in data
+             && data.reason is string
+             && data.reason.matches('.*[Ss]pam.*')
+             && data.userId == request.auth.uid;
     }
 
     function isValidDeviceRegistration() {
@@ -307,10 +334,8 @@ service cloud.firestore {
       let data = request.resource.data;
       let oldData = resource.data;
       
-      // User can only update their own device records
       return data.userId == request.auth.uid
              && oldData.userId == request.auth.uid
-             // Cannot change fingerprint
              && data.fingerprint == oldData.fingerprint;
     }
 
@@ -337,6 +362,12 @@ service cloud.firestore {
                     ) || (
                       isAdmin()
                       && isValidAdminUserUpdate()
+                    ) || (
+                      // Self-ban for spam
+                      isSignedIn()
+                      && request.auth.uid == userId
+                      && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['banned'])
+                      && request.resource.data.banned == true
                     );
 
       allow delete: if isAdmin();
@@ -358,11 +389,13 @@ service cloud.firestore {
     // 6. BANNED USERS (/banned_users)
     // ============================
 
-    match /banned_users/{userId} {
+    match /banned_users/{oduserId} {
       allow read: if isAdmin() ||
-                  (isSignedIn() && request.auth.uid == userId);
+                  (isSignedIn() && request.auth.uid == oduserId);
 
-      allow create: if isAdmin() && isValidBanRecord();
+      // Allow admin bans OR self-ban for spam
+      allow create: if (isAdmin() && isValidBanRecord()) ||
+                    (isSignedIn() && request.auth.uid == oduserId && isValidSelfBanRecord());
 
       allow update: if isAdmin();
 
@@ -374,17 +407,13 @@ service cloud.firestore {
     // ============================
 
     match /banned_devices/{fingerprintId} {
-      // Anyone can read to check if their device is banned (before auth)
-      // This allows the ban check to happen early
       allow read: if true;
 
-      // Only admins can create device bans
-      allow create: if isAdmin() && isValidDeviceBanRecord();
+      allow create: if (isAdmin() && isValidDeviceBanRecord()) ||
+                    (isSignedIn() && isValidSelfDeviceBanRecord());
 
-      // Only admins can update device bans
       allow update: if isAdmin();
 
-      // Only admins can delete (unban) devices
       allow delete: if isAdmin();
     }
 
@@ -393,16 +422,13 @@ service cloud.firestore {
     // ============================
 
     match /banned_ips/{ipId} {
-      // Anyone can read to check if their IP is banned (before auth)
       allow read: if true;
 
-      // Only admins can create IP bans
-      allow create: if isAdmin() && isValidIPBanRecord();
+      allow create: if (isAdmin() && isValidIPBanRecord()) ||
+                    (isSignedIn() && isValidSelfIPBanRecord());
 
-      // Only admins can update IP bans
       allow update: if isAdmin();
 
-      // Only admins can delete (unban) IPs
       allow delete: if isAdmin();
     }
 
@@ -411,18 +437,13 @@ service cloud.firestore {
     // ============================
 
     match /user_devices/{deviceDocId} {
-      // Admins can read all device records (to ban devices)
-      // Users can read their own device records
       allow read: if isAdmin() ||
                   (isSignedIn() && resource.data.userId == request.auth.uid);
 
-      // Users can register their own devices
       allow create: if isActiveUser() && isValidDeviceRegistration();
 
-      // Users can update their own device records (e.g., lastSeen)
       allow update: if isActiveUser() && isValidDeviceUpdate();
 
-      // Only admins can delete device records
       allow delete: if isAdmin();
     }
 
