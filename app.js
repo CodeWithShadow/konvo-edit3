@@ -130,12 +130,16 @@ async function getUserIPAddress() {
     'https://api.ipify.org?format=json',
     'https://api.ip.sb/ip',
     'https://api64.ipify.org?format=json',
+    'https://icanhazip.com',           // Add this
+  'https://ifconfig.me/ip',          // Add this
+  'https://ipecho.net/plain',        // Add this
+  'https://checkip.amazonaws.com',   // Add this
   ];
   
   for (const service of ipServices) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
+      const timeout = setTimeout(() => controller.abort(), 3000);
       
       const response = await fetch(service, { 
         signal: controller.signal,
