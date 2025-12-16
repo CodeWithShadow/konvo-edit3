@@ -1,6 +1,6 @@
 // ============================================================
 // KONVO - ANONYMOUS CHAT APPLICATION
-// Version: 3.2 (Performance Optimized)
+// Version: 3.3 (Fixed: Loading, Names, Updates)
 // ============================================================
 'use strict';
 
@@ -58,25 +58,12 @@ import {
  * Message cache for incremental updates
  */
 const messageCache = {
-  // Map of messageId -> { element, data, timestamp }
   messages: new Map(),
-  
-  // Track rendered message order
   order: [],
-  
-  // Last known scroll position
   lastScrollTop: 0,
-  
-  // Pending updates batch
   pendingUpdates: [],
-  
-  // Update timeout for batching
   updateTimeout: null,
-  
-  // Flag to prevent redundant renders
   isRendering: false,
-  
-  // Document fragment for batch DOM operations
   fragment: null,
 };
 
@@ -93,6 +80,7 @@ const elementPool = {
       const el = this.bubbles.pop();
       el.className = 'message-bubble rounded-lg max-w-xs sm:max-w-md md:max-w-lg';
       el.innerHTML = '';
+      el.removeAttribute('style');
       return el;
     }
     return document.createElement('div');
@@ -806,11 +794,11 @@ const state = {
   isBanned: false,
   isDeviceBanned: false,
 
-  // NEW: Unread counts for each tab
+  // Unread counts for each tab
   unreadChatCount: 0,
   unreadConfessionCount: 0,
   
-  // NEW: Track last seen message timestamps
+  // Track last seen message timestamps
   lastSeenChatTimestamp: Date.now(),
   lastSeenConfessionTimestamp: Date.now(),
   
@@ -819,6 +807,13 @@ const state = {
   lastRenderTime: 0,
   renderQueue: [],
   isProcessingQueue: false,
+  
+  // Track if data has been loaded from Firebase
+  chatDataLoaded: false,
+  confessionDataLoaded: false,
+  
+  // Track active reaction picker for cleanup
+  activeReactionPicker: null,
 };
 
 // Anti-Spam State
@@ -864,8 +859,8 @@ const TYPING_TIMEOUT = 3000;
 const TYPING_STALE_THRESHOLD = 5000;
 
 // PERFORMANCE: Render timing constants
-const RENDER_DEBOUNCE_MS = 16; // ~60fps
-const BATCH_SIZE = 10; // Process 10 messages at a time
+const RENDER_DEBOUNCE_MS = 16;
+const BATCH_SIZE = 10;
 const IDLE_CALLBACK_TIMEOUT = 50;
 
 // Anti-Spam Configuration
@@ -1144,11 +1139,11 @@ function showSpamBannedScreen() {
   
   const p2 = document.createElement('p');
   p2.style.cssText = 'color: #666; font-size: 0.75rem;';
-  p2.textContent = `Reason: Mana kiya tha Maat kar.`;
+  p2.textContent = `Reason: Exceeded message limit.`;
   
   const p3 = document.createElement('p');
   p3.style.cssText = 'color: #555; font-size: 0.7rem; margin-top: 1rem;';
-  p3.textContent = 'Le Lauda ho gya BAN.';
+  p3.textContent = 'Your device has been banned.';
   
   overlay.appendChild(h1);
   overlay.appendChild(p1);
@@ -1253,7 +1248,7 @@ function setupConnectionMonitor() {
   window.addEventListener('online', () => {
     console.log('Connection restored');
     if (state.isInitialized) {
-      showPage(state.currentPage);
+      showPageUI(state.currentPage);
     }
   });
 
@@ -1660,14 +1655,14 @@ async function handleAuthStateChange(user) {
 
     initScrollObserver();
     
-    // NEW: Initialize last seen timestamps
+    // Initialize last seen timestamps
     state.lastSeenChatTimestamp = Date.now();
     state.lastSeenConfessionTimestamp = Date.now();
     
-    // NEW: Setup background listeners for both collections
+    // Setup background listeners for both collections
     setupBackgroundListeners();
     
-    // Show initial page (this will now just handle UI, not listeners)
+    // Show initial page UI
     showPageUI(state.currentPage);
     
     state.isInitialized = true;
@@ -1984,22 +1979,15 @@ function updateScrollButton() {
 // NAV BADGE NOTIFICATION SYSTEM
 // ============================================================
 
-/**
- * Update the navigation badge for unread messages
- * @param {string} tab - 'chat' or 'confessions'
- * @param {number} count - Number of unread messages
- */
 function updateNavBadge(tab, count) {
   const navElement = tab === 'chat' ? navChat : navConfessions;
   if (!navElement) return;
   
-  // Remove existing badge
   const existingBadge = navElement.querySelector('.nav-badge');
   if (existingBadge) {
     existingBadge.remove();
   }
   
-  // Add new badge if count > 0
   if (count > 0) {
     const badge = document.createElement('span');
     badge.className = 'nav-badge';
@@ -2007,17 +1995,11 @@ function updateNavBadge(tab, count) {
     badge.setAttribute('aria-label', `${count} unread messages`);
     navElement.appendChild(badge);
     
-    // Add pulse animation for attention
     badge.classList.add('pulse');
     setTimeout(() => badge.classList.remove('pulse'), 1000);
   }
 }
 
-/**
- * Increment unread count for a specific tab
- * @param {string} tab - 'chat' or 'confessions'
- * @param {number} increment - Number to add (default 1)
- */
 function incrementUnreadCount(tab, increment = 1) {
   if (tab === 'chat') {
     state.unreadChatCount += increment;
@@ -2028,10 +2010,6 @@ function incrementUnreadCount(tab, increment = 1) {
   }
 }
 
-/**
- * Clear unread count for a specific tab
- * @param {string} tab - 'chat' or 'confessions'
- */
 function clearUnreadCount(tab) {
   if (tab === 'chat') {
     state.unreadChatCount = 0;
@@ -2042,23 +2020,6 @@ function clearUnreadCount(tab) {
     state.lastSeenConfessionTimestamp = Date.now();
     updateNavBadge('confessions', 0);
   }
-}
-
-/**
- * Check if a message is new (for badge counting)
- * @param {Object} data - Message data
- * @param {string} tab - 'chat' or 'confessions'
- * @returns {boolean}
- */
-function isNewMessageForBadge(data, tab) {
-  if (!data.timestamp) return false;
-  
-  const msgTime = data.timestamp.toMillis ? data.timestamp.toMillis() : data.timestamp;
-  const lastSeen = tab === 'chat' 
-    ? state.lastSeenChatTimestamp 
-    : state.lastSeenConfessionTimestamp;
-  
-  return msgTime > lastSeen;
 }
 
 function scrollToBottom() {
@@ -2073,6 +2034,29 @@ function scrollToBottom() {
 // ============================================================
 // USER PROFILES
 // ============================================================
+
+let profileUpdateTimer = null;
+
+function scheduleProfileUpdate() {
+  if (profileUpdateTimer) {
+    clearTimeout(profileUpdateTimer);
+  }
+  
+  profileUpdateTimer = setTimeout(() => {
+    const missingUserIds = new Set();
+    
+    document.querySelectorAll('.message-bubble').forEach(bubble => {
+      const userId = bubble.dataset.userId;
+      if (userId && !state.userProfiles[userId]) {
+        missingUserIds.add(userId);
+      }
+    });
+    
+    if (missingUserIds.size > 0) {
+      missingUserIds.forEach(id => requestUserProfile(id));
+    }
+  }, 50);
+}
 
 function requestUserProfile(userId) {
   if (!userId || typeof userId !== 'string') return;
@@ -2114,24 +2098,37 @@ async function loadPendingProfiles() {
         state.userProfiles[docSnap.id] = docSnap.data();
       });
       
+      // Mark unfound users with empty profile to prevent re-fetching
+      batch.forEach(userId => {
+        if (!state.userProfiles[userId]) {
+          state.userProfiles[userId] = { username: "Anonymous", notFound: true };
+        }
+      });
+      
     } catch (error) {
       console.error("Error loading user profiles:", error);
       
+      // Fallback to individual loads
       for (const userId of batch) {
+        if (state.userProfiles[userId]) continue;
+        
         try {
           const docRef = doc(state.db, "users", userId);
           const docSnap = await getDoc(docRef);
           if (docSnap.exists()) {
             state.userProfiles[docSnap.id] = docSnap.data();
+          } else {
+            state.userProfiles[userId] = { username: "Anonymous", notFound: true };
           }
         } catch (e) {
           console.warn(`Failed to load profile for ${userId}:`, e);
+          state.userProfiles[userId] = { username: "Anonymous", loadError: true };
         }
       }
     }
   }
   
-  // PERFORMANCE: Use requestAnimationFrame for DOM updates
+  // Update DOM after loading
   requestAnimationFrame(() => {
     updateDisplayedUsernames();
   });
@@ -2146,12 +2143,19 @@ function updateDisplayedUsernames() {
     if (!profile) return;
     
     const username = profile.username || "Anonymous";
+    const userColor = getUserColor(userId);
     
-    const usernameEl = bubble.querySelector('.font-bold.text-sm.opacity-90');
-    if (usernameEl && usernameEl.textContent !== username) {
-      usernameEl.textContent = username;
+    // Find username element using data attribute
+    const usernameEl = bubble.querySelector('[data-username-element="true"]');
+    
+    if (usernameEl) {
+      const currentName = usernameEl.textContent;
+      if (currentName !== username) {
+        usernameEl.textContent = username;
+      }
     }
     
+    // Update profile picture
     const imgEl = bubble.querySelector('.chat-pfp');
     if (imgEl && profile.profilePhotoURL) {
       const currentSrc = imgEl.getAttribute('src');
@@ -2747,40 +2751,163 @@ async function handleMultiDelete() {
 }
 
 // ============================================================
+// BACKGROUND LISTENERS
+// ============================================================
+
+/**
+ * Setup listeners for both chat and confessions to track unread counts
+ * This runs in the background regardless of which page you're on
+ */
+function setupBackgroundListeners() {
+  // Clean up existing listeners first
+  if (typeof unsubscribers.chat === 'function') {
+    unsubscribers.chat();
+  }
+  if (typeof unsubscribers.confessions === 'function') {
+    unsubscribers.confessions();
+  }
+  
+  // Listen for chat messages
+  const chatQuery = query(state.chatCollection, orderBy("timestamp", "asc"));
+  
+  let chatFirstSnapshot = true;
+  
+  unsubscribers.chat = onSnapshot(chatQuery, (snapshot) => {
+    state.lastChatDocs = snapshot.docs;
+    state.chatDataLoaded = true;
+    
+    // Count new messages for badge (only if not on chat page and not first snapshot)
+    if (!chatFirstSnapshot && state.currentPage !== 'chat') {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === 'added') {
+          const data = change.doc.data();
+          if (data.userId !== state.currentUserId && 
+              !data.hiddenFor?.includes(state.currentUserId)) {
+            const msgTime = data.timestamp ? data.timestamp.toMillis() : 0;
+            if (msgTime > state.lastSeenChatTimestamp) {
+              incrementUnreadCount('chat');
+            }
+          }
+        }
+      });
+    }
+    
+    // Render if we're on the chat page
+    if (state.currentPage === 'chat') {
+      const needsFullRender = chatFirstSnapshot || 
+        feedContainer?.querySelector('#loading') !== null ||
+        feedContainer?.children.length === 0 ||
+        !feedContainer?.querySelector('.message-bubble');
+      
+      renderFeedOptimized(
+        state.lastChatDocs, 
+        "chat", 
+        snapshot, 
+        false, 
+        needsFullRender
+      );
+    }
+    
+    chatFirstSnapshot = false;
+  }, (error) => {
+    console.error('Chat listener error:', error);
+    state.chatDataLoaded = true;
+    
+    if (state.currentPage === 'chat' && feedContainer) {
+      feedContainer.innerHTML = '';
+      const errorDiv = document.createElement("div");
+      errorDiv.className = "text-center p-4 text-red-500";
+      errorDiv.textContent = "Error loading chat. Please refresh.";
+      feedContainer.appendChild(errorDiv);
+    }
+  });
+  
+  // Listen for confessions
+  const confessionsQuery = query(state.confessionsCollection, orderBy("timestamp", "asc"));
+  
+  let confessionsFirstSnapshot = true;
+  
+  unsubscribers.confessions = onSnapshot(confessionsQuery, (snapshot) => {
+    state.lastConfessionDocs = snapshot.docs;
+    state.confessionDataLoaded = true;
+    
+    // Count new messages for badge (only if not on confessions page and not first snapshot)
+    if (!confessionsFirstSnapshot && state.currentPage !== 'confessions') {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === 'added') {
+          const data = change.doc.data();
+          if (data.userId !== state.currentUserId && 
+              !data.hiddenFor?.includes(state.currentUserId)) {
+            const msgTime = data.timestamp ? data.timestamp.toMillis() : 0;
+            if (msgTime > state.lastSeenConfessionTimestamp) {
+              incrementUnreadCount('confessions');
+            }
+          }
+        }
+      });
+    }
+    
+    // Render if we're on the confessions page
+    if (state.currentPage === 'confessions') {
+      const needsFullRender = confessionsFirstSnapshot || 
+        feedContainer?.querySelector('#loading') !== null ||
+        feedContainer?.children.length === 0 ||
+        !feedContainer?.querySelector('.message-bubble');
+      
+      renderFeedOptimized(
+        state.lastConfessionDocs, 
+        "confessions", 
+        snapshot, 
+        false, 
+        needsFullRender
+      );
+    }
+    
+    confessionsFirstSnapshot = false;
+  }, (error) => {
+    console.error('Confessions listener error:', error);
+    state.confessionDataLoaded = true;
+    
+    if (state.currentPage === 'confessions' && feedContainer) {
+      feedContainer.innerHTML = '';
+      const errorDiv = document.createElement("div");
+      errorDiv.className = "text-center p-4 text-red-500";
+      errorDiv.textContent = "Error loading confessions. Please refresh.";
+      feedContainer.appendChild(errorDiv);
+    }
+  });
+}
+
+// ============================================================
 // PAGE NAVIGATION
 // ============================================================
 
-function showPage(page) {
+/**
+ * Switch page UI without recreating listeners
+ * @param {string} page - 'chat' or 'confessions'
+ */
+function showPageUI(page) {
   if (page !== 'chat' && page !== 'confessions') {
     page = 'chat';
   }
   
   state.currentPage = page;
   
-  // PERFORMANCE: Clear message cache when switching pages
+  // Clear message cache when switching pages
   messageCache.messages.clear();
   messageCache.order = [];
   state.isFirstRender = true;
   
-  // NEW: Clear unread count for the page we're switching TO
+  // Clear unread count for the page we're switching TO
   clearUnreadCount(page);
   
   if (state.isSelectionMode) exitSelectionMode();
   cancelReplyMode();
   
+  // Clean up reaction pickers
   document.querySelectorAll(".reaction-picker").forEach(p => p.remove());
-  
-  if (typeof unsubscribers.confessions === 'function') {
-    unsubscribers.confessions();
-    unsubscribers.confessions = () => {};
-  }
-  if (typeof unsubscribers.chat === 'function') {
-    unsubscribers.chat();
-    unsubscribers.chat = () => {};
-  }
-  if (typeof unsubscribers.typingStatus === 'function') {
-    unsubscribers.typingStatus();
-    unsubscribers.typingStatus = () => {};
+  if (state.activeReactionPicker) {
+    state.activeReactionPicker = null;
   }
   
   if (typingIndicator) typingIndicator.innerHTML = "&nbsp;";
@@ -2794,6 +2921,7 @@ function showPage(page) {
 
   listenForPinnedMessages();
 
+  // Update navigation UI
   if (page === "confessions") {
     navConfessions?.classList.add("active");
     navConfessions?.setAttribute("aria-pressed", "true");
@@ -2810,7 +2938,6 @@ function showPage(page) {
     }
     if (typingIndicator) typingIndicator.classList.add("hidden");
     
-    listenForConfessions();
   } else {
     navChat?.classList.add("active");
     navChat?.setAttribute("aria-pressed", "true");
@@ -2827,142 +2954,40 @@ function showPage(page) {
     }
     if (typingIndicator) typingIndicator.classList.remove("hidden");
     
-    listenForChat();
     listenForTyping();
   }
+  
+  // Render content based on data state
+  renderPageContent(page);
 }
 
-// ============================================================
-// REAL-TIME LISTENERS
-// ============================================================
-
-function listenForConfessions(isRerender = false) {
-  if (isRerender) {
-    renderFeedOptimized(state.lastConfessionDocs, "confessions", null, true);
-    return;
-  }
+/**
+ * Render content for the current page based on data loading state
+ * @param {string} page - 'chat' or 'confessions'
+ */
+function renderPageContent(page) {
+  const isDataLoaded = page === 'chat' ? state.chatDataLoaded : state.confessionDataLoaded;
+  const docs = page === 'chat' ? state.lastChatDocs : state.lastConfessionDocs;
   
-  if (typeof unsubscribers.chat === 'function') {
-    unsubscribers.chat();
-    unsubscribers.chat = () => {};
-  }
+  if (!feedContainer) return;
   
-  if (feedContainer) {
+  if (isDataLoaded) {
+    // Data has been loaded from Firebase, render it (even if empty)
+    renderFeedOptimized(docs, page, null, true, true);
+  } else {
+    // Data not yet loaded, show loading state
     feedContainer.innerHTML = '';
     const loadingDiv = document.createElement('div');
     loadingDiv.id = 'loading';
     loadingDiv.className = 'text-center p-4 text-[#888888] text-sm';
-    loadingDiv.textContent = 'LOADING CONFESSIONS...';
+    loadingDiv.textContent = `LOADING ${page.toUpperCase()}...`;
     feedContainer.appendChild(loadingDiv);
   }
-  
-  let isFirstSnapshot = true;
-  
-  unsubscribers.confessions = onSnapshot(
-    query(state.confessionsCollection, orderBy("timestamp", "asc")),
-    (snapshot) => {
-      state.lastConfessionDocs = snapshot.docs;
-      
-      // NEW: Count new messages for badge (only if not on confessions page)
-      if (!isFirstSnapshot && state.currentPage !== 'confessions') {
-        snapshot.docChanges().forEach((change) => {
-          if (change.type === 'added') {
-            const data = change.doc.data();
-            // Don't count own messages or hidden messages
-            if (data.userId !== state.currentUserId && 
-                !data.hiddenFor?.includes(state.currentUserId)) {
-              const msgTime = data.timestamp ? data.timestamp.toMillis() : 0;
-              if (msgTime > state.lastSeenConfessionTimestamp) {
-                incrementUnreadCount('confessions');
-              }
-            }
-          }
-        });
-      }
-      
-      // Only render if we're on the confessions page
-      if (state.currentPage === 'confessions') {
-        renderFeedOptimized(state.lastConfessionDocs, "confessions", snapshot, false, isFirstSnapshot);
-      }
-      
-      isFirstSnapshot = false;
-    },
-    (error) => {
-      console.error('Confessions error:', error);
-      if (feedContainer && state.currentPage === 'confessions') {
-        feedContainer.innerHTML = '';
-        const errorDiv = document.createElement("div");
-        errorDiv.className = "text-center p-4 text-red-500";
-        errorDiv.textContent = "Error loading confessions: " + error.message;
-        feedContainer.appendChild(errorDiv);
-      }
-    }
-  );
 }
 
-function listenForChat(isRerender = false) {
-  if (isRerender) {
-    renderFeedOptimized(state.lastChatDocs, "chat", null, true);
-    return;
-  }
-  
-  if (typeof unsubscribers.confessions === 'function') {
-    unsubscribers.confessions();
-    unsubscribers.confessions = () => {};
-  }
-  
-  if (feedContainer) {
-    feedContainer.innerHTML = '';
-    const loadingDiv = document.createElement('div');
-    loadingDiv.id = 'loading';
-    loadingDiv.className = 'text-center p-4 text-[#888888] text-sm';
-    loadingDiv.textContent = 'LOADING CHAT...';
-    feedContainer.appendChild(loadingDiv);
-  }
-  
-  let isFirstSnapshot = true;
-  
-  unsubscribers.chat = onSnapshot(
-    query(state.chatCollection, orderBy("timestamp", "asc")),
-    (snapshot) => {
-      state.lastChatDocs = snapshot.docs;
-      
-      // NEW: Count new messages for badge (only if not on chat page)
-      if (!isFirstSnapshot && state.currentPage !== 'chat') {
-        snapshot.docChanges().forEach((change) => {
-          if (change.type === 'added') {
-            const data = change.doc.data();
-            // Don't count own messages or hidden messages
-            if (data.userId !== state.currentUserId && 
-                !data.hiddenFor?.includes(state.currentUserId)) {
-              const msgTime = data.timestamp ? data.timestamp.toMillis() : 0;
-              if (msgTime > state.lastSeenChatTimestamp) {
-                incrementUnreadCount('chat');
-              }
-            }
-          }
-        });
-      }
-      
-      // Only render if we're on the chat page
-      if (state.currentPage === 'chat') {
-        renderFeedOptimized(state.lastChatDocs, "chat", snapshot, false, isFirstSnapshot);
-      }
-      
-      isFirstSnapshot = false;
-    },
-    (error) => {
-      console.error('Chat error:', error);
-      if (feedContainer && state.currentPage === 'chat') {
-        feedContainer.innerHTML = '';
-        const errorDiv = document.createElement("div");
-        errorDiv.className = "text-center p-4 text-red-500";
-        errorDiv.textContent = "Error loading chat: " + error.message;
-        feedContainer.appendChild(errorDiv);
-      }
-    }
-  );
-}
+// ============================================================
+// TYPING INDICATOR
+// ============================================================
 
 function listenForTyping() {
   if (typeof unsubscribers.typingStatus === 'function') {
@@ -3039,186 +3064,7 @@ const updateTypingStatus = debounce(async (isTyping) => {
 }, 300);
 
 // ============================================================
-// BACKGROUND LISTENERS FOR UNREAD BADGES
-// ============================================================
-
-/**
- * Setup listeners for both chat and confessions to track unread counts
- * This runs in the background regardless of which page you're on
- */
-function setupBackgroundListeners() {
-  // Listen for chat messages in background
-  const chatQuery = query(state.chatCollection, orderBy("timestamp", "asc"));
-  
-  let chatFirstSnapshot = true;
-  const chatUnsub = onSnapshot(chatQuery, (snapshot) => {
-    state.lastChatDocs = snapshot.docs;
-    
-    if (!chatFirstSnapshot && state.currentPage !== 'chat') {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type === 'added') {
-          const data = change.doc.data();
-          if (data.userId !== state.currentUserId && 
-              !data.hiddenFor?.includes(state.currentUserId)) {
-            const msgTime = data.timestamp ? data.timestamp.toMillis() : 0;
-            if (msgTime > state.lastSeenChatTimestamp) {
-              incrementUnreadCount('chat');
-            }
-          }
-        }
-      });
-    }
-    
-    if (state.currentPage === 'chat') {
-      renderFeedOptimized(state.lastChatDocs, "chat", snapshot, false, chatFirstSnapshot);
-    }
-    
-    chatFirstSnapshot = false;
-  }, (error) => {
-    console.error('Background chat listener error:', error);
-  });
-  
-  // Listen for confessions in background
-  const confessionsQuery = query(state.confessionsCollection, orderBy("timestamp", "asc"));
-  
-  let confessionsFirstSnapshot = true;
-  const confessionsUnsub = onSnapshot(confessionsQuery, (snapshot) => {
-    state.lastConfessionDocs = snapshot.docs;
-    
-    if (!confessionsFirstSnapshot && state.currentPage !== 'confessions') {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type === 'added') {
-          const data = change.doc.data();
-          if (data.userId !== state.currentUserId && 
-              !data.hiddenFor?.includes(state.currentUserId)) {
-            const msgTime = data.timestamp ? data.timestamp.toMillis() : 0;
-            if (msgTime > state.lastSeenConfessionTimestamp) {
-              incrementUnreadCount('confessions');
-            }
-          }
-        }
-      });
-    }
-    
-    if (state.currentPage === 'confessions') {
-      renderFeedOptimized(state.lastConfessionDocs, "confessions", snapshot, false, confessionsFirstSnapshot);
-    }
-    
-    confessionsFirstSnapshot = false;
-  }, (error) => {
-    console.error('Background confessions listener error:', error);
-  });
-  
-  // Store unsubscribers
-  unsubscribers.chat = chatUnsub;
-  unsubscribers.confessions = confessionsUnsub;
-}
-
-// ============================================================
-// PAGE UI SWITCHING
-// ============================================================
-
-/**
- * Switch page UI without recreating listeners
- * @param {string} page - 'chat' or 'confessions'
- */
-function showPageUI(page) {
-  if (page !== 'chat' && page !== 'confessions') {
-    page = 'chat';
-  }
-  
-  state.currentPage = page;
-  
-  // Clear message cache when switching pages
-  messageCache.messages.clear();
-  messageCache.order = [];
-  state.isFirstRender = true;
-  
-  // Clear unread count for the page we're switching TO
-  clearUnreadCount(page);
-  
-  if (state.isSelectionMode) exitSelectionMode();
-  cancelReplyMode();
-  
-  document.querySelectorAll(".reaction-picker").forEach(p => p.remove());
-  
-  if (typingIndicator) typingIndicator.innerHTML = "&nbsp;";
-  state.unreadMessages = 0;
-  
-  if (newMsgCount) newMsgCount.classList.add("hidden");
-  if (scrollToBottomBtn) {
-    scrollToBottomBtn.classList.add("hidden");
-    scrollToBottomBtn.style.display = "";
-  }
-
-  listenForPinnedMessages();
-
-  if (page === "confessions") {
-    navConfessions?.classList.add("active");
-    navConfessions?.setAttribute("aria-pressed", "true");
-    navChat?.classList.remove("active");
-    navChat?.setAttribute("aria-pressed", "false");
-    
-    if (confessionForm) {
-      confessionForm.classList.add("flex");
-      confessionForm.classList.remove("hidden");
-    }
-    if (chatForm) {
-      chatForm.classList.add("hidden");
-      chatForm.classList.remove("flex");
-    }
-    if (typingIndicator) typingIndicator.classList.add("hidden");
-    
-    // Render confessions from cached docs
-    if (state.lastConfessionDocs.length > 0) {
-      renderFeedOptimized(state.lastConfessionDocs, "confessions", null, true, true);
-    } else {
-      if (feedContainer) {
-        feedContainer.innerHTML = '';
-        const loadingDiv = document.createElement('div');
-        loadingDiv.id = 'loading';
-        loadingDiv.className = 'text-center p-4 text-[#888888] text-sm';
-        loadingDiv.textContent = 'LOADING CONFESSIONS...';
-        feedContainer.appendChild(loadingDiv);
-      }
-    }
-    
-  } else {
-    navChat?.classList.add("active");
-    navChat?.setAttribute("aria-pressed", "true");
-    navConfessions?.classList.remove("active");
-    navConfessions?.setAttribute("aria-pressed", "false");
-    
-    if (chatForm) {
-      chatForm.classList.add("flex");
-      chatForm.classList.remove("hidden");
-    }
-    if (confessionForm) {
-      confessionForm.classList.add("hidden");
-      confessionForm.classList.remove("flex");
-    }
-    if (typingIndicator) typingIndicator.classList.remove("hidden");
-    
-    // Render chat from cached docs
-    if (state.lastChatDocs.length > 0) {
-      renderFeedOptimized(state.lastChatDocs, "chat", null, true, true);
-    } else {
-      if (feedContainer) {
-        feedContainer.innerHTML = '';
-        const loadingDiv = document.createElement('div');
-        loadingDiv.id = 'loading';
-        loadingDiv.className = 'text-center p-4 text-[#888888] text-sm';
-        loadingDiv.textContent = 'LOADING CHAT...';
-        feedContainer.appendChild(loadingDiv);
-      }
-    }
-    
-    listenForTyping();
-  }
-}
-
-// ============================================================
-// PERFORMANCE: OPTIMIZED RENDER FEED
+// MESSAGE ELEMENT CREATION
 // ============================================================
 
 /**
@@ -3278,8 +3124,8 @@ function createMessageElement(docInstance, type, lastUserId, lastDateString) {
   const row = document.createElement("div");
   row.className = "message-wrapper";
 
-  // Message bubble
-  const bubble = document.createElement("div");
+  // Message bubble - use element pool
+  const bubble = elementPool.getBubble();
   bubble.className = `message-bubble rounded-lg max-w-xs sm:max-w-md md:max-w-lg ${isMine ? "my-message" : ""}`;
   
   if (data.isPinned) {
@@ -3344,6 +3190,7 @@ function createMessageElement(docInstance, type, lastUserId, lastDateString) {
     const usernameElement = document.createElement("div");
     usernameElement.className = `font-bold text-sm opacity-90 ${isMine ? "order-1 text-right" : "order-2 text-left"}`;
     usernameElement.textContent = username;
+    usernameElement.dataset.usernameElement = "true"; // For reliable DOM queries
     if (!isMine) usernameElement.style.color = userColor;
     
     headerElement.appendChild(imgElement);
@@ -3490,6 +3337,7 @@ function createMessageElement(docInstance, type, lastUserId, lastDateString) {
       toggleReaction(docId, type, rtype, hasReacted);
       picker.classList.add("hidden");
       picker.remove();
+      state.activeReactionPicker = null;
     };
     picker.appendChild(opt);
   });
@@ -3497,10 +3345,13 @@ function createMessageElement(docInstance, type, lastUserId, lastDateString) {
   reactBtn.onclick = (e) => {
     e.stopPropagation();
     
-    document.querySelectorAll(".reaction-picker").forEach(p => {
-      p.classList.add("hidden");
-      p.remove();
-    });
+    // Clean up existing picker
+    if (state.activeReactionPicker) {
+      state.activeReactionPicker.remove();
+      state.activeReactionPicker = null;
+    }
+    
+    document.querySelectorAll(".reaction-picker").forEach(p => p.remove());
     
     const rect = reactBtn.getBoundingClientRect();
     picker.style.top = `${rect.top - 60}px`;
@@ -3514,6 +3365,17 @@ function createMessageElement(docInstance, type, lastUserId, lastDateString) {
     
     picker.classList.remove("hidden");
     document.body.appendChild(picker);
+    state.activeReactionPicker = picker;
+    
+    // Auto-close after 5 seconds
+    setTimeout(() => {
+      if (picker.parentNode) {
+        picker.remove();
+        if (state.activeReactionPicker === picker) {
+          state.activeReactionPicker = null;
+        }
+      }
+    }, 5000);
   };
 
   // Bubble wrapper
@@ -3544,6 +3406,60 @@ function createMessageElement(docInstance, type, lastUserId, lastDateString) {
   };
 }
 
+// ============================================================
+// OPTIMIZED FEED RENDERING
+// ============================================================
+
+/**
+ * Update reaction chips on a message bubble
+ */
+function updateBubbleReactions(bubble, reactions, docId, type) {
+  // Remove existing chips
+  const existingChips = bubble.querySelector('.reaction-chips-container');
+  if (existingChips) {
+    existingChips.remove();
+    bubble.classList.remove('has-reactions');
+  }
+  
+  // Create new chips if there are reactions
+  let hasChips = false;
+  const chipsContainer = document.createElement("div");
+  chipsContainer.className = "reaction-chips-container";
+  
+  Object.keys(REACTION_TYPES).forEach(rtype => {
+    const userIds = reactions[rtype] || [];
+    if (userIds.length > 0) {
+      hasChips = true;
+      const chip = document.createElement("div");
+      chip.className = "reaction-chip";
+      
+      const hasReacted = userIds.includes(state.currentUserId);
+      if (hasReacted) chip.classList.add("user-reacted");
+      
+      const emojiSpan = document.createElement("span");
+      emojiSpan.textContent = REACTION_TYPES[rtype];
+      
+      const countSpan = document.createElement("span");
+      countSpan.textContent = ` ${userIds.length}`;
+      
+      chip.appendChild(emojiSpan);
+      chip.appendChild(countSpan);
+      
+      chip.onclick = (e) => {
+        e.stopPropagation();
+        toggleReaction(docId, type, rtype, hasReacted);
+      };
+      
+      chipsContainer.appendChild(chip);
+    }
+  });
+  
+  if (hasChips) {
+    bubble.appendChild(chipsContainer);
+    bubble.classList.add("has-reactions");
+  }
+}
+
 /**
  * PERFORMANCE: Optimized incremental render
  */
@@ -3552,6 +3468,9 @@ function renderFeedOptimized(docs, type, snapshot, isRerender, isFirstSnapshot =
   
   // Clean up reaction pickers
   document.querySelectorAll(".reaction-picker").forEach(p => p.remove());
+  if (state.activeReactionPicker) {
+    state.activeReactionPicker = null;
+  }
   
   // Handle notifications for new messages
   if (!isRerender && snapshot) {
@@ -3577,23 +3496,27 @@ function renderFeedOptimized(docs, type, snapshot, isRerender, isFirstSnapshot =
 
   const wasAtBottom = state.userIsAtBottom;
   
-  // PERFORMANCE: For first render or full refresh, use DocumentFragment
-  if (state.isFirstRender || isFirstSnapshot || isRerender) {
+  // FULL RENDER: For first render, page switch, or when container is empty/loading
+  const containerHasMessages = feedContainer.querySelector('.message-bubble') !== null;
+  const shouldFullRender = state.isFirstRender || isFirstSnapshot || isRerender || !containerHasMessages;
+  
+  if (shouldFullRender) {
     state.isFirstRender = false;
     
     const fragment = document.createDocumentFragment();
     
     if (docs.length === 0) {
+      // No messages - show empty state
       const emptyDiv = document.createElement("div");
       emptyDiv.id = "loading";
       emptyDiv.className = "text-center p-4 text-[#888888] text-sm";
       emptyDiv.textContent = `NO ${type.toUpperCase()} YET. BE THE FIRST!`;
       fragment.appendChild(emptyDiv);
     } else {
+      // Render all messages
       let lastUserId = null;
       let lastDateString = null;
       
-      // Process messages in batches using requestAnimationFrame
       docs.forEach((docInstance) => {
         const result = createMessageElement(docInstance, type, lastUserId, lastDateString);
         
@@ -3603,20 +3526,22 @@ function renderFeedOptimized(docs, type, snapshot, isRerender, isFirstSnapshot =
           lastDateString = result.lastDateString;
           
           // Cache the message
-          messageCache.messages.set(result.docId, {
-            data: docInstance.data(),
-            timestamp: Date.now()
-          });
+          if (result.docId) {
+            messageCache.messages.set(result.docId, {
+              data: docInstance.data(),
+              timestamp: Date.now()
+            });
+          }
         }
       });
+      
+      // Scroll anchor for detecting when user is at bottom
+      const scrollAnchor = document.createElement("div");
+      scrollAnchor.id = "scrollAnchor";
+      scrollAnchor.style.height = "1px";
+      scrollAnchor.style.width = "100%";
+      fragment.appendChild(scrollAnchor);
     }
-    
-    // Scroll anchor
-    const scrollAnchor = document.createElement("div");
-    scrollAnchor.id = "scrollAnchor";
-    scrollAnchor.style.height = "1px";
-    scrollAnchor.style.width = "100%";
-    fragment.appendChild(scrollAnchor);
     
     // Single DOM update
     feedContainer.innerHTML = '';
@@ -3631,18 +3556,21 @@ function renderFeedOptimized(docs, type, snapshot, isRerender, isFirstSnapshot =
       }
     }
     
-    // Scroll handling
-    if (isFirstSnapshot && docs.length > 0) {
+    // Scroll to bottom on first load
+    if ((isFirstSnapshot || isRerender) && docs.length > 0) {
       requestAnimationFrame(() => {
         feedContainer.scrollTop = feedContainer.scrollHeight;
         state.userIsAtBottom = true;
       });
     }
     
+    // Trigger profile loading for all visible messages
+    scheduleProfileUpdate();
+    
     return;
   }
   
-  // PERFORMANCE: Incremental update for subsequent changes
+  // INCREMENTAL UPDATE: For subsequent changes
   if (snapshot) {
     const changes = snapshot.docChanges();
     
@@ -3662,7 +3590,8 @@ function renderFeedOptimized(docs, type, snapshot, isRerender, isFirstSnapshot =
         const escapedId = escapeSelector(id);
         const element = feedContainer.querySelector(`.message-bubble[data-id="${escapedId}"]`);
         if (element) {
-          // Remove the entire align wrapper
+          // Recycle element before removing
+          elementPool.recycle(element);
           const alignWrapper = element.closest('.flex.w-full');
           if (alignWrapper) {
             alignWrapper.remove();
@@ -3680,11 +3609,13 @@ function renderFeedOptimized(docs, type, snapshot, isRerender, isFirstSnapshot =
       let lastDateString = null;
       
       // Get last rendered message info
-      const lastBubble = feedContainer.querySelector('.message-bubble:last-of-type');
+      const allBubbles = feedContainer.querySelectorAll('.message-bubble');
+      const lastBubble = allBubbles[allBubbles.length - 1];
+      
       if (lastBubble) {
-        lastUserId = lastBubble.dataset.userId;
+        lastUserId = lastBubble.dataset.userId || null;
         const ts = parseInt(lastBubble.dataset.timestamp, 10);
-        if (ts) {
+        if (ts && !isNaN(ts)) {
           lastDateString = new Date(ts).toDateString();
         }
       }
@@ -3697,10 +3628,12 @@ function renderFeedOptimized(docs, type, snapshot, isRerender, isFirstSnapshot =
           lastUserId = result.lastUserId;
           lastDateString = result.lastDateString;
           
-          messageCache.messages.set(result.docId, {
-            data: docInstance.data(),
-            timestamp: Date.now()
-          });
+          if (result.docId) {
+            messageCache.messages.set(result.docId, {
+              data: docInstance.data(),
+              timestamp: Date.now()
+            });
+          }
         }
       });
       
@@ -3709,7 +3642,17 @@ function renderFeedOptimized(docs, type, snapshot, isRerender, isFirstSnapshot =
       if (scrollAnchor) {
         feedContainer.insertBefore(fragment, scrollAnchor);
       } else {
+        // No scroll anchor, create one
+        const newAnchor = document.createElement("div");
+        newAnchor.id = "scrollAnchor";
+        newAnchor.style.height = "1px";
+        newAnchor.style.width = "100%";
         feedContainer.appendChild(fragment);
+        feedContainer.appendChild(newAnchor);
+        
+        if (state.bottomObserver) {
+          state.bottomObserver.observe(newAnchor);
+        }
       }
       
       // Check if we should scroll
@@ -3727,6 +3670,9 @@ function renderFeedOptimized(docs, type, snapshot, isRerender, isFirstSnapshot =
         state.unreadMessages += addedDocs.length;
         updateScrollButton();
       }
+      
+      // Trigger profile loading
+      scheduleProfileUpdate();
     }
     
     // Handle modifications (reactions, edits, pins)
@@ -3739,11 +3685,20 @@ function renderFeedOptimized(docs, type, snapshot, isRerender, isFirstSnapshot =
       const existingBubble = feedContainer.querySelector(`.message-bubble[data-id="${escapedId}"]`);
       
       if (existingBubble) {
+        // Check if message should now be hidden
+        if (data.hiddenFor?.includes(state.currentUserId)) {
+          const alignWrapper = existingBubble.closest('.flex.w-full');
+          if (alignWrapper) {
+            elementPool.recycle(existingBubble);
+            alignWrapper.remove();
+          }
+          messageCache.messages.delete(docId);
+          return;
+        }
+        
         // Update text if edited
         const textEl = existingBubble.querySelector('p.text-left');
         if (textEl) {
-          // Preserve pin icon if present
-          const pinIcon = textEl.querySelector('.text-amber-400');
           textEl.textContent = '';
           
           if (data.isPinned) {
@@ -3758,65 +3713,20 @@ function renderFeedOptimized(docs, type, snapshot, isRerender, isFirstSnapshot =
         
         // Update timestamp if edited
         const timeEl = existingBubble.querySelector('.inner-timestamp');
-        if (timeEl && data.edited) {
+        if (timeEl) {
           const ts = parseInt(timeEl.dataset.ts, 10);
-          if (ts) {
-            timeEl.textContent = formatMessageTime(new Date(ts)) + " (edited)";
+          if (ts && !isNaN(ts)) {
+            let timeText = formatMessageTime(new Date(ts));
+            if (data.edited) timeText += " (edited)";
+            timeEl.textContent = timeText;
           }
         }
         
         // Update reactions
-        const existingChips = existingBubble.querySelector('.reaction-chips-container');
-        if (existingChips) {
-          existingChips.remove();
-          existingBubble.classList.remove('has-reactions');
-        }
-        
-        const docReactions = data.reactions || {};
-        let hasChips = false;
-        const chipsContainer = document.createElement("div");
-        chipsContainer.className = "reaction-chips-container";
-        
-        Object.keys(REACTION_TYPES).forEach(rtype => {
-          const userIds = docReactions[rtype] || [];
-          if (userIds.length > 0) {
-            hasChips = true;
-            const chip = document.createElement("div");
-            chip.className = "reaction-chip";
-            
-            const hasReacted = userIds.includes(state.currentUserId);
-            if (hasReacted) chip.classList.add("user-reacted");
-            
-            const emojiSpan = document.createElement("span");
-            emojiSpan.textContent = REACTION_TYPES[rtype];
-            
-            const countSpan = document.createElement("span");
-            countSpan.textContent = ` ${userIds.length}`;
-            
-            chip.appendChild(emojiSpan);
-            chip.appendChild(countSpan);
-            
-            chip.onclick = (e) => {
-              e.stopPropagation();
-              toggleReaction(docId, type, rtype, hasReacted);
-            };
-            
-            chipsContainer.appendChild(chip);
-          }
-        });
-        
-        if (hasChips) {
-          existingBubble.appendChild(chipsContainer);
-          existingBubble.classList.add("has-reactions");
-        }
+        updateBubbleReactions(existingBubble, data.reactions || {}, docId, type);
         
         // Update pin status
-        if (data.isPinned) {
-          existingBubble.classList.add("pinned");
-        } else {
-          existingBubble.classList.remove("pinned");
-        }
-        
+        existingBubble.classList.toggle("pinned", Boolean(data.isPinned));
         existingBubble.dataset.isPinned = String(data.isPinned || false);
         
         // Update cache
@@ -3926,8 +3836,6 @@ async function postMessage(collectionRef, input) {
     cancelReplyMode();
     updateTypingStatus(false);
     
-    // PERFORMANCE: Scroll will happen automatically via the incremental render
-    
     const counter = input === chatInput ? chatCharCount : confessionCharCount;
     updateCharacterCounter(input, counter);
     
@@ -3992,9 +3900,9 @@ function cancelReplyMode() {
 document.addEventListener("click", (e) => {
   if (!e.target.closest(".side-action-btn") && !e.target.closest(".reaction-picker")) {
     document.querySelectorAll(".reaction-picker").forEach(p => {
-      p.classList.add("hidden");
       p.remove();
     });
+    state.activeReactionPicker = null;
   }
   
   if (!contextMenu?.contains(e.target) && !e.target.closest(".kebab-btn")) {
@@ -4002,7 +3910,7 @@ document.addEventListener("click", (e) => {
   }
 });
 
-// PERFORMANCE: Throttled timestamp updates
+// Throttled timestamp updates
 const updateTimestamps = throttle(() => {
   document.querySelectorAll('.inner-timestamp').forEach(el => {
     const ts = parseInt(el.dataset.ts, 10);
