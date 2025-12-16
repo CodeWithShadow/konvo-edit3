@@ -463,13 +463,13 @@ body.selection-mode .message-bubble {
 
 .kebab-btn {
   position: absolute;
-  top: 6px; /* breathe away from bubble corner */
-  right: -40px; /* more gap so it doesn't feel like it's touching */
+  top: 0;
+  right: -32px;
   width: 26px;
   height: 26px;
   padding: 0;
   border-radius: 50%;
-  background: rgba(28, 28, 28, 0.9);
+  background: var(--surface);
   border: 1px solid var(--border-color);
   color: var(--text-muted);
   opacity: 0;
@@ -480,14 +480,14 @@ body.selection-mode .message-bubble {
   justify-content: center;
   transition: all 0.3s var(--ease-out-expo);
   z-index: calc(var(--z-base) + 50);
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.55);
-  transform: scale(0.85);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  transform: scale(0.8);
 }
 
 /* For my messages - position at top-left corner outside */
 .bubble-wrapper.my-bubble-wrapper .kebab-btn {
   right: auto;
-  left: -40px;
+  left: -32px;
 }
 
 /* Show on message-wrapper hover - same as reaction/reply */
@@ -532,13 +532,12 @@ body.selection-mode .message-bubble {
   .kebab-btn {
     width: 24px;
     height: 24px;
-    right: -36px;
-    top: 6px;
+    right: -28px;
   }
   
   .bubble-wrapper.my-bubble-wrapper .kebab-btn {
     right: auto;
-    left: -36px;
+    left: -28px;
   }
 
   /* On mobile, account for always-visible side action buttons to avoid horizontal scrolling */
@@ -550,15 +549,14 @@ body.selection-mode .message-bubble {
 /* Extra small screens - tighter position */
 @media (max-width: 400px) {
   .kebab-btn {
-    right: -30px;
+    right: -22px;
     width: 22px;
     height: 22px;
-    top: 6px;
   }
   
   .bubble-wrapper.my-bubble-wrapper .kebab-btn {
     right: auto;
-    left: -30px;
+    left: -22px;
   }
 }
 
@@ -615,15 +613,15 @@ body.selection-mode .message-bubble {
 
 .message-wrapper {
   display: flex;
-  align-items: center; /* keeps reply/react vertically aligned with the bubble */
+  align-items: flex-end;
   gap: 8px;
   max-width: 100%;
   min-width: 0;
 }
 
 .side-action-btn {
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px solid transparent;
+  background: none;
+  border: none;
   color: var(--text-muted);
   opacity: 0;
   cursor: pointer;
@@ -634,13 +632,12 @@ body.selection-mode .message-bubble {
   align-items: center;
   justify-content: center;
   font-size: 1rem;
-  line-height: 1;
   transition: all 0.3s var(--ease-out-expo);
-  margin-bottom: 0;
+  margin-bottom: 4px;
   flex-shrink: 0;
   position: relative;
   z-index: calc(var(--z-base) + 20);
-  transform: scale(0.85);
+  transform: scale(0.8);
 }
 
 .message-wrapper:hover .side-action-btn {
@@ -652,8 +649,7 @@ body.selection-mode .message-bubble {
   opacity: 1 !important;
   color: var(--text-main);
   background-color: var(--surface);
-  border-color: var(--border-color);
-  transform: scale(1.12) !important;
+  transform: scale(1.15) !important;
 }
 
 /* Touch devices - always show action buttons */
