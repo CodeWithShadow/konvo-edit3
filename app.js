@@ -66,7 +66,21 @@ const deviceState = {
 };
 
 /**
- * Generate device fingerprint using FingerprintJS
+ * Wrapper to add timeout to any promise
+ * @param {Promise} promise - The promise to wrap
+ * @param {number} ms - Timeout in milliseconds
+ * @param {*} fallbackValue - Value to return on timeout
+ * @returns {Promise} - Promise that resolves with result or fallback
+ */
+function withTimeout(promise, ms, fallbackValue = null) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallbackValue), ms))
+  ]);
+}
+
+/**
+ * Generate device fingerprint using FingerprintJS with timeout
  * @returns {Promise<string>} - Device fingerprint ID
  */
 async function generateDeviceFingerprint() {
@@ -77,8 +91,19 @@ async function generateDeviceFingerprint() {
       return generateFallbackFingerprint();
     }
     
-    const fp = await FingerprintJS.load();
-    const result = await fp.get();
+    // Add 5 second timeout to FingerprintJS.load()
+    const fp = await withTimeout(FingerprintJS.load(), 5000, null);
+    if (!fp) {
+      console.warn('FingerprintJS.load() timed out, using fallback');
+      return generateFallbackFingerprint();
+    }
+    
+    // Add 5 second timeout to fp.get()
+    const result = await withTimeout(fp.get(), 5000, null);
+    if (!result) {
+      console.warn('FingerprintJS.get() timed out, using fallback');
+      return generateFallbackFingerprint();
+    }
     
     // The visitorId is a stable identifier
     deviceState.fingerprint = result.visitorId;
@@ -123,53 +148,40 @@ function generateFallbackFingerprint() {
 }
 
 /**
- * Get user's IP address using multiple fallback services
+ * Get user's IP address using parallel requests with timeout
  * @returns {Promise<string|null>} - IP address or null
  */
 async function getUserIPAddress() {
   const ipServices = [
     'https://api.ipify.org?format=json',
-    'https://api.ip.sb/ip',
     'https://api64.ipify.org?format=json',
   ];
   
-  for (const service of ipServices) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-      
-      const response = await fetch(service, { 
-        signal: controller.signal,
-        mode: 'cors'
-      });
-      
-      clearTimeout(timeout);
-      
-      if (response.ok) {
-        const text = await response.text();
-        
-        // Try to parse as JSON first
-        try {
-          const json = JSON.parse(text);
-          const ip = json.ip || json.query || json.ipAddress;
-          if (ip && isValidIP(ip)) {
-            deviceState.ipAddress = ip;
-            console.log('IP address retrieved');
-            return ip;
-          }
-        } catch {
-          // Not JSON, use raw text
-          const ip = text.trim();
-          if (isValidIP(ip)) {
-            deviceState.ipAddress = ip;
-            console.log('IP address retrieved');
-            return ip;
-          }
-        }
+  // Try all services in parallel, use first success with 3 second timeout
+  try {
+    const fetchPromises = ipServices.map(async (service) => {
+      const response = await fetch(service, { mode: 'cors' });
+      if (!response.ok) throw new Error('Failed');
+      const data = await response.json();
+      if (data.ip && isValidIP(data.ip)) {
+        return data.ip;
       }
-    } catch (error) {
-      console.warn(`IP service ${service} failed:`, error.message);
+      throw new Error('Invalid IP');
+    });
+    
+    const result = await withTimeout(
+      Promise.any(fetchPromises),
+      3000,  // 3 second total timeout
+      null
+    );
+    
+    if (result) {
+      deviceState.ipAddress = result;
+      console.log('IP address retrieved');
+      return result;
     }
+  } catch (error) {
+    console.warn('IP detection failed:', error.message);
   }
   
   console.warn('Could not retrieve IP address');
@@ -217,16 +229,37 @@ function hashIP(ip) {
 }
 
 /**
- * Initialize device identification
+ * Initialize device identification with overall timeout
  * @returns {Promise<Object>} - Device info object
  */
 async function initializeDeviceIdentification() {
   try {
-    // Generate fingerprint and get IP in parallel
-    const [fingerprint, ipAddress] = await Promise.all([
-      generateDeviceFingerprint(),
-      getUserIPAddress()
-    ]);
+    // Total timeout of 8 seconds for device identification
+    const result = await withTimeout(
+      Promise.all([
+        generateDeviceFingerprint(),
+        getUserIPAddress()
+      ]),
+      8000,
+      null  // Will trigger fallback below
+    );
+    
+    // If timeout occurred, use fallback
+    if (!result) {
+      console.warn('Device identification timed out, using fallback');
+      return {
+        fingerprint: generateFallbackFingerprint(),
+        ipAddress: null,
+        ipHash: null,
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        screenResolution: `${screen.width}x${screen.height}`,
+        platform: navigator.platform,
+      };
+    }
+    
+    const [fingerprint, ipAddress] = result;
     
     deviceState.fingerprint = fingerprint;
     deviceState.ipAddress = ipAddress;
@@ -1732,13 +1765,20 @@ async function toggleBanUser() {
 // ============================================================
 
 async function initFirebase() {
+  // ⭐ Global timeout - show app after 15 seconds no matter what
+  const globalTimeout = setTimeout(() => {
+    console.warn('Initialization timeout - showing app anyway');
+    hideBanCheckOverlay();
+  }, 15000);
+  
   try {
-    // First, initialize device identification
+    // Initialize device identification with timeout
     console.log('Initializing device identification...');
     state.deviceInfo = await initializeDeviceIdentification();
     
     state.app = initializeApp(firebaseConfig);
 
+    // App Check (non-blocking)
     try {
       initializeAppCheck(state.app, {
         provider: new ReCaptchaEnterpriseProvider('6LfnNiwsAAAAAGq_faIyfph6OmKKvaEfU-c8_QIH'),
@@ -1748,6 +1788,7 @@ async function initFirebase() {
       console.warn('App Check initialization failed:', appCheckError);
     }
 
+    // Firestore initialization
     try {
       state.db = initializeFirestore(state.app, {
         localCache: persistentLocalCache({
@@ -1759,24 +1800,28 @@ async function initFirebase() {
       state.db = initializeFirestore(state.app, {});
     }
 
-    // Check for device-level ban BEFORE authentication
-    console.log('Checking device ban status...');
-    const deviceBanCheck = await checkDeviceBan(state.db, state.deviceInfo);
-    
-    if (deviceBanCheck.isBanned) {
-      console.log('Device is banned:', deviceBanCheck.reason);
-      state.isDeviceBanned = true;
-      showDeviceBannedScreen(deviceBanCheck.reason);
-      return;
-    }
+    // ⭐ REMOVED: Pre-auth device ban check - moved to handleAuthStateChange
+    // This was causing the hang because it tried to read Firestore before auth
 
     state.auth = getAuth(state.app);
-    onAuthStateChanged(state.auth, handleAuthStateChange);
+    
+    // ⭐ Wrap auth state handler with error handling
+    onAuthStateChanged(state.auth, async (user) => {
+      try {
+        await handleAuthStateChange(user);
+      } catch (error) {
+        console.error('Auth state change error:', error);
+        hideBanCheckOverlay();
+      } finally {
+        clearTimeout(globalTimeout);
+      }
+    });
 
   } catch (error) {
     console.error("Error initializing Firebase:", error);
     setTextSafely(loading, "Error: Could not initialize. Please refresh.");
     hideBanCheckOverlay();
+    clearTimeout(globalTimeout);
     throw error;
   }
 }
@@ -1786,42 +1831,71 @@ async function handleAuthStateChange(user) {
     state.currentUserId = user.uid;
     console.log("Authenticated with UID:", state.currentUserId);
 
-    // Register device with user association (SECURE FORMAT)
-    await registerDevice(state.db, state.currentUserId, state.deviceInfo);
+    // ⭐ STEP 1: Register device FIRST
+    try {
+      await registerDevice(state.db, state.currentUserId, state.deviceInfo);
+      console.log('Device registered successfully');
+    } catch (regError) {
+      console.warn('Device registration failed:', regError);
+    }
 
+    // ⭐ STEP 2: Check for device ban AFTER registration
+    try {
+      console.log('Checking device ban status...');
+      const deviceBanCheck = await withTimeout(
+        checkDeviceBan(state.db, state.deviceInfo),
+        5000,
+        { isBanned: false, reason: null }
+      );
+      
+      if (deviceBanCheck.isBanned) {
+        console.log('Device is banned:', deviceBanCheck.reason);
+        state.isDeviceBanned = true;
+        showDeviceBannedScreen(deviceBanCheck.reason);
+        return;
+      }
+    } catch (banCheckError) {
+      console.warn('Device ban check failed, continuing:', banCheckError);
+    }
+
+    // ⭐ STEP 3: Initialize collections
     state.confessionsCollection = collection(state.db, "confessions");
     state.chatCollection = collection(state.db, "chat");
     state.typingStatusCollection = collection(state.db, "typingStatus");
 
+    // ⭐ STEP 4: Setup features
     registerServiceWorker();
     setupNotificationButton();
     setupAdminMenu();
     setupConnectionMonitor();
 
+    // ⭐ STEP 5: Start listeners
     listenForUserProfiles();
     listenForBanStatus();
     listenForDeviceBans();
 
+    // ⭐ STEP 6: Check admin status
     try {
       await checkAdminStatus();
     } catch (e) {
       console.error("Admin check failed:", e);
     }
 
+    // ⭐ STEP 7: Load user profile
     try {
       await loadUserProfile();
     } catch (e) {
       console.error("Profile load failed:", e);
     }
 
-    // Hide the loading overlay
+    // ⭐ STEP 8: Show the app
     hideBanCheckOverlay();
-
     initScrollObserver();
     showPage(state.currentPage);
     state.isInitialized = true;
     
   } else {
+    // Not authenticated - sign in anonymously
     try {
       await signInAnonymously(state.auth);
     } catch (e) {
