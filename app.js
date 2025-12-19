@@ -2402,30 +2402,82 @@ async function loadUserProfile() {
 }
 
 async function handleProfileSave() {
-  if (!state.db || !state.currentUserId) return;
-  
-  const inputVal = modalUsernameInput.value.trim();
-  
-  if (!isValidUsername(inputVal)) {
-    showToast("Invalid username. Use letters, numbers, underscores, hyphens, and spaces only (1-30 characters).", "error");
-    modalUsernameInput.classList.add("error");
-    setTimeout(() => modalUsernameInput.classList.remove("error"), 500);
+  // Early validation
+  if (!state.db || !state.currentUserId) {
+    showToast("Not connected. Please refresh the page.", "error");
     return;
   }
   
-  modalSaveButton.textContent = "CHECKING...";
-  modalSaveButton.disabled = true;
-  modalCloseButton.disabled = true;
-  modalUsernameInput.disabled = true;
-  modalSaveButton.classList.add("loading");
+  const inputVal = modalUsernameInput?.value?.trim();
+  
+  // Validate input exists
+  if (!inputVal) {
+    showToast("Please enter a username.", "error");
+    return;
+  }
+  
+  // Validate username format
+  if (!isValidUsername(inputVal)) {
+    showToast("Invalid username. Use letters, numbers, underscores, hyphens, and spaces only (1-30 characters).", "error");
+    if (modalUsernameInput) {
+      modalUsernameInput.classList.add("error");
+      setTimeout(() => modalUsernameInput.classList.remove("error"), 500);
+    }
+    return;
+  }
+  
+  // Helper function to reset button state
+  const resetButtonState = () => {
+    if (modalSaveButton) {
+      modalSaveButton.textContent = "Save";
+      modalSaveButton.disabled = false;
+      modalSaveButton.classList.remove("loading");
+    }
+    if (modalCloseButton) {
+      modalCloseButton.disabled = false;
+    }
+    if (modalUsernameInput) {
+      modalUsernameInput.disabled = false;
+    }
+  };
+  
+  // Set loading state
+  if (modalSaveButton) {
+    modalSaveButton.textContent = "CHECKING...";
+    modalSaveButton.disabled = true;
+    modalSaveButton.classList.add("loading");
+  }
+  if (modalCloseButton) {
+    modalCloseButton.disabled = true;
+  }
+  if (modalUsernameInput) {
+    modalUsernameInput.disabled = true;
+  }
   
   try {
+    // Step 1: Check if username is taken
+    console.log('Checking if username is available:', inputVal);
+    
     const q = query(
       collection(state.db, "users"), 
       where("username", "==", inputVal)
     );
-    const querySnapshot = await getDocs(q);
     
+    const querySnapshot = await withTimeout(
+      getDocs(q),
+      10000,  // 10 second timeout
+      null
+    );
+    
+    // Handle timeout
+    if (querySnapshot === null) {
+      console.error('Username check timed out');
+      showToast("Request timed out. Please try again.", "error");
+      resetButtonState();
+      return;
+    }
+    
+    // Check if username is taken by another user
     let isTaken = false;
     querySnapshot.forEach((docSnapshot) => {
       if (docSnapshot.id !== state.currentUserId) {
@@ -2434,20 +2486,34 @@ async function handleProfileSave() {
     });
     
     if (isTaken) {
+      console.log('Username is taken');
       showToast("Username is already taken!", "error");
+      resetButtonState();
       return;
     }
     
-    modalSaveButton.textContent = "SAVING...";
+    // Step 2: Save the profile
+    console.log('Username available, saving profile...');
+    
+    if (modalSaveButton) {
+      modalSaveButton.textContent = "SAVING...";
+    }
     
     const firstLetter = inputVal.charAt(0).toUpperCase();
     const newProfilePhotoURL = `https://placehold.co/32x32/000000/ffffff?text=${encodeURIComponent(firstLetter)}`;
     
-    await setDoc(doc(state.db, "users", state.currentUserId), {
-      username: inputVal,
-      profilePhotoURL: newProfilePhotoURL,
-    }, { merge: true });
+    await withTimeout(
+      setDoc(doc(state.db, "users", state.currentUserId), {
+        username: inputVal,
+        profilePhotoURL: newProfilePhotoURL,
+      }, { merge: true }),
+      10000,  // 10 second timeout
+      null
+    );
     
+    console.log('Profile saved successfully');
+    
+    // Update local state
     state.currentUsername = inputVal;
     state.currentProfilePhotoURL = newProfilePhotoURL;
     
@@ -2457,17 +2523,24 @@ async function handleProfileSave() {
       profilePhotoURL: newProfilePhotoURL
     };
     
+    // Success - close modal
+    showToast("Profile saved successfully!", "info");
     closeProfileModal();
+    resetButtonState();
     
   } catch (error) {
     console.error("Error saving profile:", error);
-    showToast("Error saving profile. Please try again.", "error");
-  } finally {
-    modalSaveButton.textContent = "SAVE";
-    modalSaveButton.disabled = false;
-    modalCloseButton.disabled = false;
-    modalUsernameInput.disabled = false;
-    modalSaveButton.classList.remove("loading");
+    
+    // Provide specific error messages
+    if (error.code === 'permission-denied') {
+      showToast("Permission denied. You may be banned.", "error");
+    } else if (error.code === 'unavailable') {
+      showToast("Server unavailable. Please try again.", "error");
+    } else {
+      showToast("Error saving profile: " + (error.message || "Unknown error"), "error");
+    }
+    
+    resetButtonState();
   }
 }
 
