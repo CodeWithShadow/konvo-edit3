@@ -52,18 +52,20 @@ service cloud.firestore {
       return col in ['chat', 'confessions'];
     }
 
-    // FIXED: Added rate limiting check
     function canSendMessage() {
-      let userDoc = get(/databases/$(database)/documents/users/$(request.auth.uid));
-      let lastMessage = userDoc.data.get('lastMessageAt', timestamp.date(1970, 1, 1));
-      
-      return isActiveUser()
-             && exists(/databases/$(database)/documents/users/$(request.auth.uid))
-             && userDoc.data.username is string
-             && userDoc.data.username.size() >= 1
-             // Rate limit: 1 message per 2 seconds
-             && lastMessage + duration.value(2, 's') < request.time;
-    }
+  let userDocRef = /databases/$(database)/documents/users/$(request.auth.uid);
+  
+  // First check if user exists and is active
+  return isActiveUser()
+         && exists(userDocRef)
+         && get(userDocRef).data.username is string
+         && get(userDocRef).data.username.size() >= 1
+         // Rate limit: only check if lastMessageAt exists
+         && (
+           !('lastMessageAt' in get(userDocRef).data) ||
+           get(userDocRef).data.lastMessageAt + duration.value(2, 's') < request.time
+         );
+}
 
     function isValidUsername(username) {
       return username is string

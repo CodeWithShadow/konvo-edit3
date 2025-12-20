@@ -3648,58 +3648,45 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
 
 /**
  * Post a message with rate limiting and spam protection
- * Uses batch write to update both message and lastMessageAt atomically
  */
 async function postMessage(collectionRef, input) {
+  // Early validations
+  if (!state.db || !state.currentUserId) {
+    showToast("Not connected. Please refresh.", "error");
+    return;
+  }
+  
   if (state.currentUsername === "Anonymous") {
     showToast("Please set a username first!", "error");
     openProfileModal();
     return;
   }
   
-  // Check device ban before posting
   if (state.isDeviceBanned) {
     showToast("Your device has been banned.", "error");
     return;
   }
   
-  // Check user ban
   if (state.isBanned) {
     showToast("You have been banned.", "error");
     return;
   }
   
-  // Check spam status BEFORE anything else
+  // Check spam status
   const spamCheck = checkSpamStatus();
   
   if (!spamCheck.allowed) {
     if (spamCheck.shouldBan) {
-      // User hit spam limit - auto-ban them
       await autoBanForSpam();
       return;
     }
   }
   
-  // Show warning if approaching limit
   if (spamCheck.warning) {
     showSpamWarning(spamCheck.warning);
   }
   
-  // Verify ban status from Firestore
-  if (state.db && state.currentUserId) {
-    try {
-      const banRef = doc(state.db, "banned_users", state.currentUserId);
-      const banSnap = await getDoc(banRef);
-      if (banSnap.exists()) {
-        showToast("You have been banned from posting.", "error");
-        input.value = "";
-        return;
-      }
-    } catch (e) {
-      console.warn("Ban check error:", e);
-    }
-  }
-  
+  // Validate message
   const validation = validateMessageBeforePost(input.value);
   if (!validation.valid) {
     showToast(validation.error, "error");
@@ -3708,14 +3695,29 @@ async function postMessage(collectionRef, input) {
   
   const text = validation.text;
   
-  if (!state.db) return;
-  
-  input.disabled = true;
-  
-  const submitBtn = collectionRef === state.chatCollection ? 
+  // Get button reference
+  const isChat = collectionRef === state.chatCollection;
+  const submitBtn = isChat ? 
     document.getElementById('chatButton') : 
     document.getElementById('confessionButton');
-    
+  
+  // Helper to reset UI
+  const resetUI = () => {
+    if (input) {
+      input.disabled = false;
+      input.focus();
+    }
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.classList.remove('loading');
+      submitBtn.textContent = isChat ? 'SEND' : 'POST';
+    }
+  };
+  
+  // Set loading state
+  if (input) {
+    input.disabled = true;
+  }
   if (submitBtn) {
     submitBtn.disabled = true;
     submitBtn.classList.add('loading');
@@ -3723,17 +3725,13 @@ async function postMessage(collectionRef, input) {
   }
   
   try {
-    const userId = state.currentUserId;
-    const userRef = doc(state.db, "users", userId);
+    console.log('Posting message...');
     
-    // Use batch write to update both message and lastMessageAt atomically
-    const batch = writeBatch(state.db);
-    
-    // Create the message document
+    // Build message data
     const messageData = {
       text: text,
       timestamp: serverTimestamp(),
-      userId: userId,
+      userId: state.currentUserId,
     };
     
     // Add reply data if replying
@@ -3741,50 +3739,71 @@ async function postMessage(collectionRef, input) {
       messageData.replyTo = {
         messageId: state.replyToMessage.id,
         userId: state.replyToMessage.userId,
-        text: state.replyToMessage.text?.substring(0, 500) || ''
+        text: (state.replyToMessage.text || '').substring(0, 500)
       };
     }
     
-    // Determine collection name for addDoc
-    const collectionName = collectionRef === state.chatCollection ? 'chat' : 'confessions';
+    // Step 1: Add the message with timeout
+    const addResult = await withTimeout(
+      addDoc(collectionRef, messageData),
+      15000,  // 15 second timeout
+      null
+    );
     
-    // Add the message
-    await addDoc(collectionRef, messageData);
+    if (addResult === null) {
+      throw new Error('Message send timed out');
+    }
     
-    // Update lastMessageAt for rate limiting (separate call since addDoc doesn't work in batch)
-    await setDoc(userRef, {
-      lastMessageAt: serverTimestamp()
-    }, { merge: true });
-
-    // Record this message for spam tracking
+    console.log('Message posted successfully:', addResult.id);
+    
+    // Step 2: Update lastMessageAt for rate limiting (non-blocking)
+    // This is separate and won't block the user if it fails
+    try {
+      const userRef = doc(state.db, "users", state.currentUserId);
+      await setDoc(userRef, {
+        lastMessageAt: serverTimestamp()
+      }, { merge: true });
+    } catch (rateError) {
+      console.warn('Rate limit update failed (non-critical):', rateError);
+      // Don't throw - message was already sent
+    }
+    
+    // Record for spam tracking
     recordMessage();
-
-    input.value = "";
+    
+    // Clear input and reset UI
+    if (input) {
+      input.value = "";
+    }
+    
     cancelReplyMode();
     updateTypingStatus(false);
     scrollToBottom();
     
-    const counter = input === chatInput ? chatCharCount : confessionCharCount;
-    updateCharacterCounter(input, counter);
+    // Update character counter
+    const counter = isChat ? chatCharCount : confessionCharCount;
+    if (counter) {
+      updateCharacterCounter(input, counter);
+    }
     
-  } catch (e) {
-    console.error('Post error:', e);
-    if (e.code === 'permission-denied') {
-      // Likely rate limited
-      showToast("Please wait a moment before sending another message.", "error");
+    console.log('Message flow completed');
+    resetUI();
+    
+  } catch (error) {
+    console.error('Post error:', error);
+    
+    // Provide specific error messages
+    if (error.code === 'permission-denied') {
+      showToast("Permission denied. Please wait a moment and try again.", "error");
+    } else if (error.message === 'Message send timed out') {
+      showToast("Message timed out. Please check your connection.", "error");
+    } else if (error.code === 'unavailable') {
+      showToast("Server unavailable. Please try again.", "error");
     } else {
       showToast("Failed to send message. Please try again.", "error");
     }
-  
-  } finally {
-    input.disabled = false;
-    input.focus();
     
-    if (submitBtn) {
-      submitBtn.disabled = false;
-      submitBtn.classList.remove('loading');
-      submitBtn.textContent = collectionRef === state.chatCollection ? 'SEND' : 'POST';
-    }
+    resetUI();
   }
 }
 
