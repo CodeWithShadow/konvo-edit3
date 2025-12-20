@@ -1153,9 +1153,10 @@ function recordMessage() {
   spamTracker.messageTimestamps.push(Date.now());
 }
 
+
 /**
- * Auto-ban user for spamming - SECURE VERSION
- * Fetches actual username from profile and ensures device is registered
+ * Auto-ban user for spamming - SECURE VERSION WITH IP BAN
+ * Bans: user account, device fingerprint, AND verified IP hash
  */
 async function autoBanForSpam() {
   if (!state.db || !state.currentUserId) return;
@@ -1165,8 +1166,9 @@ async function autoBanForSpam() {
   try {
     const userId = state.currentUserId;
     const fingerprint = state.deviceInfo?.fingerprint;
+    const ipHash = state.deviceInfo?.ipHash;
     
-    // SECURITY: Fetch actual username from Firestore profile
+    // Fetch actual username from Firestore profile
     let actualUsername = '';
     try {
       const userDoc = await getDoc(doc(state.db, "users", userId));
@@ -1177,22 +1179,37 @@ async function autoBanForSpam() {
       console.warn('Could not fetch username for ban:', e);
     }
     
-    // SECURITY: Ensure device is registered before banning
+    // Verify device is registered (required for IP ban verification)
+    let deviceRegistered = false;
+    let storedIpHash = null;
+    
     if (fingerprint) {
       const deviceDocId = `${userId}_${fingerprint}`;
       const deviceRef = doc(state.db, "user_devices", deviceDocId);
-      const deviceSnap = await getDoc(deviceRef);
       
-      if (!deviceSnap.exists()) {
-        // Register device first (required by security rules)
-        await setDoc(deviceRef, {
-          userId: userId,
-          fingerprint: fingerprint,
-          firstSeen: serverTimestamp(),
-          lastSeen: serverTimestamp(),
-          userAgent: state.deviceInfo?.userAgent || null,
-          platform: state.deviceInfo?.platform || null,
-        });
+      try {
+        const deviceSnap = await getDoc(deviceRef);
+        if (deviceSnap.exists()) {
+          deviceRegistered = true;
+          storedIpHash = deviceSnap.data().ipHash || null;
+        } else {
+          // Register device first if not exists
+          await setDoc(deviceRef, {
+            userId: userId,
+            fingerprint: fingerprint,
+            ipHash: ipHash || null,
+            ipAddress: state.deviceInfo?.ipAddress || null,
+            firstSeen: serverTimestamp(),
+            lastSeen: serverTimestamp(),
+            userAgent: state.deviceInfo?.userAgent || null,
+            platform: state.deviceInfo?.platform || null,
+          });
+          deviceRegistered = true;
+          storedIpHash = ipHash;
+          console.log('Device registered for ban');
+        }
+      } catch (e) {
+        console.warn('Device check/registration failed:', e);
       }
     }
     
@@ -1202,17 +1219,17 @@ async function autoBanForSpam() {
     const userRef = doc(state.db, "users", userId);
     batch.set(userRef, { banned: true }, { merge: true });
     
-    // 2. Add to banned_users collection (must contain "spam" or "Spam" in reason)
+    // 2. Add to banned_users collection
     const banRef = doc(state.db, "banned_users", userId);
     batch.set(banRef, {
       bannedBy: "SYSTEM_AUTO_BAN",
       timestamp: serverTimestamp(),
       reason: "Automatic ban: Spam detection (exceeded message limit)",
-      username: actualUsername // Must match actual profile
+      username: actualUsername
     });
     
-    // 3. Ban device fingerprint (reason must contain "spam" or "Spam")
-    if (fingerprint) {
+    // 3. Ban device fingerprint (if device is registered)
+    if (fingerprint && deviceRegistered) {
       const fingerprintBanRef = doc(state.db, "banned_devices", fingerprint);
       batch.set(fingerprintBanRef, {
         fingerprint: fingerprint,
@@ -1224,39 +1241,30 @@ async function autoBanForSpam() {
         userAgent: state.deviceInfo?.userAgent || null,
         platform: state.deviceInfo?.platform || null,
       });
+      console.log('Fingerprint ban queued');
     }
     
-    // 4. Ban IP address (hashed) - reason must contain "spam" or "Spam"
-    if (state.deviceInfo?.ipHash) {
-      const ipBanRef = doc(state.db, "banned_ips", state.deviceInfo.ipHash);
+    // 4. Ban IP hash (ONLY if it matches the stored device IP hash)
+    // This is the SECURE verification - rules will also verify this
+    if (ipHash && deviceRegistered && storedIpHash && ipHash === storedIpHash) {
+      const ipBanRef = doc(state.db, "banned_ips", ipHash);
       batch.set(ipBanRef, {
-        ipHash: state.deviceInfo.ipHash,
-        ipAddress: state.deviceInfo.ipAddress || null,
+        ipHash: ipHash,
+        fingerprint: fingerprint,  // Required for rule verification
         userId: userId,
         username: actualUsername,
         bannedBy: "SYSTEM_AUTO_BAN",
         timestamp: serverTimestamp(),
         reason: "Automatic ban: Spam detection",
       });
-    }
-    
-    // 5. Ban raw IP address (for compatibility)
-    if (state.deviceInfo?.ipAddress) {
-      const rawIpKey = state.deviceInfo.ipAddress.replace(/\./g, '_');
-      const rawIpBanRef = doc(state.db, "banned_ips", rawIpKey);
-      batch.set(rawIpBanRef, {
-        ipAddress: state.deviceInfo.ipAddress,
-        userId: userId,
-        username: actualUsername,
-        bannedBy: "SYSTEM_AUTO_BAN",
-        timestamp: serverTimestamp(),
-        reason: "Automatic ban: Spam detection",
-      });
+      console.log('IP hash ban queued');
+    } else {
+      console.warn('IP ban skipped - hash mismatch or not available');
     }
     
     await batch.commit();
     
-    console.log('User auto-banned for spam');
+    console.log('User auto-banned for spam successfully');
     
     // Update local state
     state.isBanned = true;
