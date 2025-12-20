@@ -807,13 +807,13 @@ function createKebabIcon() {
 // ============================================================
 
 const firebaseConfig = {
-  apiKey: "AIzaSyB8T4naak4ZlMGLKGFLpWEKXHqRSw4O9Xc",
-  authDomain: "konvomain-fa7ed.firebaseapp.com",
-  projectId: "konvomain-fa7ed",
-  storageBucket: "konvomain-fa7ed.firebasestorage.app",
-  messagingSenderId: "81540120286",
-  appId: "1:81540120286:web:9a01799acba41c35c48c4f"
-};
+    apiKey: "AIzaSyBRkDnKaAu0Q6pI-ihTum3CbNxRsJD--h0",
+    authDomain: "konvo-endgame2.firebaseapp.com",
+    projectId: "konvo-endgame2",
+    storageBucket: "konvo-endgame2.firebasestorage.app",
+    messagingSenderId: "214620265342",
+    appId: "1:214620265342:web:8dd90c4690530ecb73312f"
+  };
 const appStartTime = Date.now();
 
 // ============================================================
