@@ -2704,7 +2704,7 @@ function closeConfirmModal() {
 // ============================================================
 
 /**
- * Toggle reaction with transaction for atomic updates
+ * Toggle reaction with OPTIMISTIC UI update (instant feedback)
  * @param {string} docId - Document ID
  * @param {string} collectionName - Collection name
  * @param {string} reactionType - Reaction type key
@@ -2717,37 +2717,133 @@ async function toggleReaction(docId, collectionName, reactionType, hasReacted) {
     return;
   }
   
+  // ⭐ STEP 1: Optimistic UI Update (INSTANT)
+  const escapedId = escapeSelector(docId);
+  const bubble = document.querySelector(`.message-bubble[data-id="${escapedId}"]`);
+  
+  if (bubble) {
+    updateReactionUI(bubble, reactionType, !hasReacted, collectionName);
+  }
+  
+  // ⭐ STEP 2: Update Firestore in background (async)
   const docRef = doc(state.db, collectionName, docId);
   
   try {
-    await runTransaction(state.db, async (transaction) => {
-      const messageSnap = await transaction.get(docRef);
-      
-      if (!messageSnap.exists()) {
-        throw new Error('Message not found');
-      }
-      
-      const reactions = messageSnap.data().reactions || {};
-      const currentReactions = reactions[reactionType] || [];
-      
-      let newReactions;
-      if (currentReactions.includes(state.currentUserId)) {
-        // Remove reaction
-        newReactions = currentReactions.filter(id => id !== state.currentUserId);
-      } else {
-        // Add reaction
-        newReactions = [...currentReactions, state.currentUserId];
-      }
-      
-      transaction.update(docRef, {
-        [`reactions.${reactionType}`]: newReactions
+    if (hasReacted) {
+      // Remove reaction
+      await updateDoc(docRef, {
+        [`reactions.${reactionType}`]: arrayRemove(state.currentUserId)
       });
-    });
+    } else {
+      // Add reaction
+      await updateDoc(docRef, {
+        [`reactions.${reactionType}`]: arrayUnion(state.currentUserId)
+      });
+    }
+    
+    console.log('Reaction synced:', reactionType, hasReacted ? 'removed' : 'added');
     
   } catch (error) {
     console.error("Reaction error:", error);
+    
+    // ⭐ STEP 3: Revert UI if server update failed
+    if (bubble) {
+      updateReactionUI(bubble, reactionType, hasReacted, collectionName);
+    }
+    
     if (error.code === 'permission-denied') {
-      showToast("Unable to add reaction. Please try again.", "error");
+      showToast("Unable to add reaction.", "error");
+    }
+  }
+}
+
+/**
+ * Update reaction UI immediately (optimistic update)
+ * @param {HTMLElement} bubble - Message bubble element
+ * @param {string} reactionType - Reaction type
+ * @param {boolean} isAdding - Whether adding or removing reaction
+ * @param {string} collectionName - Collection name for click handler
+ */
+function updateReactionUI(bubble, reactionType, isAdding, collectionName) {
+  if (!bubble) return;
+  
+  let chipsContainer = bubble.querySelector('.reaction-chips-container');
+  
+  // Create container if doesn't exist
+  if (!chipsContainer) {
+    chipsContainer = document.createElement('div');
+    chipsContainer.className = 'reaction-chips-container';
+    bubble.appendChild(chipsContainer);
+  }
+  
+  // Find existing chip for this reaction type
+  let existingChip = null;
+  chipsContainer.querySelectorAll('.reaction-chip').forEach(chip => {
+    const emoji = chip.querySelector('span')?.textContent;
+    if (emoji === REACTION_TYPES[reactionType]) {
+      existingChip = chip;
+    }
+  });
+  
+  if (isAdding) {
+    // ADDING reaction
+    if (existingChip) {
+      // Increment count
+      const countSpan = existingChip.querySelectorAll('span')[1];
+      if (countSpan) {
+        const currentCount = parseInt(countSpan.textContent.trim()) || 0;
+        countSpan.textContent = ` ${currentCount + 1}`;
+      }
+      existingChip.classList.add('user-reacted');
+    } else {
+      // Create new chip
+      const chip = document.createElement('div');
+      chip.className = 'reaction-chip user-reacted';
+      chip.style.animation = 'modalZoom 0.2s ease-out';
+      
+      const emojiSpan = document.createElement('span');
+      emojiSpan.textContent = REACTION_TYPES[reactionType];
+      
+      const countSpan = document.createElement('span');
+      countSpan.textContent = ' 1';
+      
+      chip.appendChild(emojiSpan);
+      chip.appendChild(countSpan);
+      
+      // Add click handler
+      chip.onclick = (e) => {
+        e.stopPropagation();
+        toggleReaction(bubble.dataset.id, collectionName, reactionType, true);
+      };
+      
+      chipsContainer.appendChild(chip);
+    }
+    
+    // Add margin for reactions
+    bubble.classList.add('has-reactions');
+    
+  } else {
+    // REMOVING reaction
+    if (existingChip) {
+      const countSpan = existingChip.querySelectorAll('span')[1];
+      if (countSpan) {
+        const currentCount = parseInt(countSpan.textContent.trim()) || 0;
+        
+        if (currentCount <= 1) {
+          // Remove chip entirely
+          existingChip.remove();
+          
+          // Remove container if empty
+          if (chipsContainer.children.length === 0) {
+            chipsContainer.remove();
+            bubble.classList.remove('has-reactions');
+          }
+        } else {
+          // Decrement count
+          countSpan.textContent = ` ${currentCount - 1}`;
+          existingChip.classList.remove('user-reacted');
+        }
+      }
     }
   }
 }
