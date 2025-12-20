@@ -3860,17 +3860,17 @@ async function postMessage(collectionRef, input) {
     
     console.log('Message posted successfully:', addResult.id);
     
-    // Step 2: Update lastMessageAt for rate limiting (non-blocking)
-    // This is separate and won't block the user if it fails
+    // Rate limiting removed - keeping code commented for future reference
+    /*
     try {
-      const userRef = doc(state.db, "users", state.currentUserId);
-      await setDoc(userRef, {
-        lastMessageAt: serverTimestamp()
-      }, { merge: true });
+    const userRef = doc(state.db, "users", state.currentUserId);
+    await setDoc(userRef, {
+    lastMessageAt: serverTimestamp()
+    }, { merge: true });
     } catch (rateError) {
-      console.warn('Rate limit update failed (non-critical):', rateError);
-      // Don't throw - message was already sent
+    console.warn('Rate limit update failed (non-critical):', rateError);
     }
+    */
     
     // Record for spam tracking
     recordMessage();

@@ -5,7 +5,7 @@ service cloud.firestore {
 
     // ============================================================
     // KONVO - ANONYMOUS CHAT PLATFORM SECURITY RULES
-    // Version: 4.3 (Secure Auto IP Ban Enabled)
+    // Version: 4.4 (No Rate Limit)
     // ============================================================
 
     // ============================
@@ -51,17 +51,14 @@ service cloud.firestore {
       return col in ['chat', 'confessions'];
     }
 
+    // UPDATED: Rate limiter removed
     function canSendMessage() {
       let userDocRef = /databases/$(database)/documents/users/$(request.auth.uid);
       
       return isActiveUser()
              && exists(userDocRef)
              && get(userDocRef).data.username is string
-             && get(userDocRef).data.username.size() >= 1
-             && (
-               !('lastMessageAt' in get(userDocRef).data) ||
-               get(userDocRef).data.lastMessageAt + duration.value(2, 's') < request.time
-             );
+             && get(userDocRef).data.username.size() >= 1;
     }
 
     function isValidUsername(username) {
@@ -381,7 +378,6 @@ service cloud.firestore {
       let fingerprint = data.get('fingerprint', '');
       let deviceDocId = request.auth.uid + '_' + fingerprint;
       
-      // Basic validation
       let basicValid = data.bannedBy == "SYSTEM_AUTO_BAN"
              && data.timestamp == request.time
              && 'reason' in data
@@ -395,10 +391,8 @@ service cloud.firestore {
              && 'fingerprint' in data
              && fingerprint.size() > 0;
       
-      // Verify fingerprint belongs to user
       let deviceExists = exists(/databases/$(database)/documents/user_devices/$(deviceDocId));
       
-      // Verify IP hash matches what's in user's device record
       let deviceData = deviceExists ? 
                        get(/databases/$(database)/documents/user_devices/$(deviceDocId)).data : 
                        null;
@@ -407,7 +401,6 @@ service cloud.firestore {
                           deviceData.userId == request.auth.uid &&
                           deviceData.ipHash == data.ipHash;
       
-      // Document ID must match the ipHash being banned
       let docIdMatches = ipHashDocId == data.ipHash;
       
       return basicValid && deviceExists && ipHashMatches && docIdMatches;
@@ -512,7 +505,6 @@ service cloud.firestore {
     // ============================
 
     match /banned_devices/{fingerprintId} {
-      // Users can only check ban status for fingerprints they own
       allow read: if isAdmin() ||
                   (isSignedIn() && 
                    exists(/databases/$(database)/documents/user_devices/$(request.auth.uid + '_' + fingerprintId)));
@@ -526,18 +518,15 @@ service cloud.firestore {
     }
 
     // ============================
-    // 8. BANNED IPS (/banned_ips) - SECURED WITH VERIFICATION
+    // 8. BANNED IPS (/banned_ips)
     // ============================
 
     match /banned_ips/{ipHashId} {
-      // Users can only check ban status for IPs registered to their devices
       allow read: if isAdmin() ||
                   (isSignedIn() && 
                    ipHashId.size() > 0 &&
                    ipHashId.size() <= 64);
 
-      // Admin can create IP bans freely
-      // Users can only self-ban with VERIFIED IP hash
       allow create: if (isAdmin() && isValidIPBanRecord()) ||
                     (isSignedIn() && isValidSelfIPBanRecord(ipHashId));
 
