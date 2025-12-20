@@ -21,7 +21,7 @@
 })();
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-import { initializeAppCheck, ReCaptchaEnterpriseProvider } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app-check.js";
+//import { initializeAppCheck, ReCaptchaEnterpriseProvider } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app-check.js";
 import {
   getAuth,
   signInAnonymously,
@@ -42,13 +42,11 @@ import {
   getDocs,
   where,
   orderBy,
-  limit,
   updateDoc,
   deleteDoc,
   writeBatch,
   arrayUnion,
   arrayRemove,
-  runTransaction,
 } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
 // ============================================================
@@ -1704,45 +1702,23 @@ async function toggleBanUser() {
       
       // Ban/Unban IP hash (avoid duplicates)
       if (deviceData.ipHash && !processedIPs.has(deviceData.ipHash)) {
-        processedIPs.add(deviceData.ipHash);
-        const ipBanRef = doc(state.db, "banned_ips", deviceData.ipHash);
-        
-        if (isBanned) {
-          batch.delete(ipBanRef);
-        } else {
-          batch.set(ipBanRef, {
-            ipHash: deviceData.ipHash,
-            ipAddress: deviceData.ipAddress || null,
-            userId: userId,
-            username: username?.substring(0, 30) || 'Unknown',
-            bannedBy: state.currentUserId,
-            timestamp: serverTimestamp(),
-            reason: "Admin Action",
-          });
-        }
-      }
+  processedIPs.add(deviceData.ipHash);
+  const ipBanRef = doc(state.db, "banned_ips", deviceData.ipHash);
+  
+  if (isBanned) {
+    batch.delete(ipBanRef);
+  } else {
+    batch.set(ipBanRef, {
+      ipHash: deviceData.ipHash,
+      userId: userId,
+      username: username?.substring(0, 30) || 'Unknown',
+      bannedBy: state.currentUserId,
+      timestamp: serverTimestamp(),
+      reason: "Admin Action",
+    });
+  }
+}
       
-      // Also handle raw IP if available (avoid duplicates)
-      if (deviceData.ipAddress) {
-        const rawIpKey = deviceData.ipAddress.replace(/\./g, '_');
-        if (!processedIPs.has(rawIpKey)) {
-          processedIPs.add(rawIpKey);
-          const rawIpBanRef = doc(state.db, "banned_ips", rawIpKey);
-          
-          if (isBanned) {
-            batch.delete(rawIpBanRef);
-          } else {
-            batch.set(rawIpBanRef, {
-              ipAddress: deviceData.ipAddress,
-              userId: userId,
-              username: username?.substring(0, 30) || 'Unknown',
-              bannedBy: state.currentUserId,
-              timestamp: serverTimestamp(),
-              reason: "Admin Action",
-            });
-          }
-        }
-      }
     }
     
     await batch.commit();
@@ -1786,6 +1762,7 @@ async function initFirebase() {
     
     state.app = initializeApp(firebaseConfig);
 
+    /*
     // App Check (non-blocking)
     try {
       initializeAppCheck(state.app, {
@@ -1795,6 +1772,7 @@ async function initFirebase() {
     } catch (appCheckError) {
       console.warn('App Check initialization failed:', appCheckError);
     }
+    */
 
     // Firestore initialization
     try {
